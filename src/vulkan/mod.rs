@@ -1312,9 +1312,13 @@ impl Backend for Vk {
         self.run("router_topk", &[], [t, 1, 1], &[&p, &ids, &wts, &(n as u32), &(k as u32), &extra_scale])
     }
     fn moe_route(&self, p: u64, n: usize, k: usize, extra_scale: f32, table: u64, ids: u64, wts: u64, slots: u64, wh: u64, h: u64, mb: u64, nh: usize, h_off: usize, step: u64, t: usize, pid: u64) -> anyhow::Result<()> {
-        debug_assert_eq!(pid, 0, "the Vulkan backend has no next-layer prefetch");
         ensure!(n <= 512 && k <= 32, "moe_route: {n} experts, top {k}");
-        self.run("moe_route", &[], [1, 1, 1], &[&p, &table, &ids, &wts, &slots, &wh, &h, &mb, &step, &(n as u32), &(k as u32), &extra_scale, &(nh as u32), &(h_off as u32), &(t as u32)])
+        self.run("moe_route", &[], [1, 1, 1], &[&p, &table, &ids, &wts, &slots, &wh, &h, &mb, &step, &pid, &(n as u32), &(k as u32), &extra_scale, &(nh as u32), &(h_off as u32), &(t as u32)])
+    }
+    fn moe_prefetch_supported(&self) -> bool { true }
+    fn moe_prefetch(&self, ids: u64, k: usize, table: u64, base: u64, stride: usize, bytes: usize) -> anyhow::Result<()> {
+        let lines = bytes.div_ceil(128);
+        self.run("moe_route", &[], [lines.div_ceil(256), k, 1], &[&base, &table, &ids, &0u64, &0u64, &0u64, &0u64, &0u64, &0u64, &0u64, &0u32, &(k as u32), &0f32, &(stride as u32), &(bytes as u32), &0u32])
     }
     fn moe_combine(&self, x: u64, ye: u64, w: u64, k: usize, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, slots: u64, n: usize, t: usize) -> anyhow::Result<()> {
         let err = self.0.st().err.3;

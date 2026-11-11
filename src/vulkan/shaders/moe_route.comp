@@ -4,14 +4,28 @@
 layout(local_size_x = 256) in;
 #include "common.glsl"
 #include "topk.glsl"
-layout(push_constant) uniform P { F32 p; I32 table; I32 ids; F32 wts; I32 slots; F32 wh; F32 h; MB mb; I32 step; uint n; uint k;
+layout(push_constant) uniform P { F32 p; I32 table; I32 ids; F32 wts; I32 slots; F32 wh; F32 h; MB mb; I32 step; I32 pid; uint n; uint k;
     float extra_scale; uint nh; uint h_off; uint T; } p;
 
 // Decode routing of T tokens in one workgroup (subgroup i routes tokens i, i + 8, ...): router_topk, the expert cache
 // lookup (slots = table[ids], -1 = not resident; wh = weight of hits, else 0), then the routing (and h, if an expert
 // missed) copied to the host-mapped mailbox, T stored in word 1, word 8 zeroed and the request flag (word 0) raised to step[1].
+// With T == 0 (moe_prefetch), touches one word per 128-byte cache line of the predicted experts into L2.
 shared bool miss;
 void main() {
+    if (p.T == 0) {
+        int e = p.ids.v[gl_WorkGroupID.y];
+        if (e < 0) return;
+        int s = p.table.v[e];
+        if (s < 0) return;
+        uint line = gl_WorkGroupID.x * 256 + gl_LocalInvocationID.x;
+        if (line * 128 < p.h_off) {
+            uint64_t addr = uint64_t(p.p) + uint64_t(s) * uint64_t(p.nh) + uint64_t(line) * 128ul;
+            uint v = U32(addr).v[0];
+            if (v == 0xdeadbeefu && uint64_t(p.mb) == 1ul) p.ids.v[0] = int(v);
+        }
+        return;
+    }
     uint lane = LANE, kt = p.k * p.T;
     if (gl_LocalInvocationID.x == 0) miss = false;
     barrier();
@@ -23,6 +37,7 @@ void main() {
             uint o = t * p.k + lane;
             int s = p.table.v[id];
             p.ids.v[o] = id; p.wts.v[o] = w; p.slots.v[o] = s; p.wh.v[o] = s >= 0 ? w : 0.0;
+            if (uint64_t(p.pid) != 0 && t + 1 == p.T) p.pid.v[lane] = id;
             if (uint64_t(p.mb) != 0) {
                 p.mb.v[32 + o] = uint(id); p.mb.v[32 + kt + o] = floatBitsToUint(w); p.mb.v[32 + 2 * kt + o] = uint(s);
                 if (s < 0) miss = true;

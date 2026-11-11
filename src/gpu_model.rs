@@ -1091,27 +1091,25 @@ impl<'a> GpuModel<'a> {
             match &l.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, snap } => {
                     let (sc, ss, ns) = snap.as_ref().map_or((0, 0, 0), |(a, b)| (a.addr(), b.addr(), self.k));
-                    g.batch(&mut || {
-                        mv2(qkv, gate, "qkv", "z")?;
-                        mv2(beta, alpha, "beta", "g")
-                    })?;
+                    mv(qkv, "h", ne, "qkv", channels)?;
                     // One token with 128-wide heads: conv_silu also does the q and k l2 norms.
+                    // Overlap conv_silu/conv_seq (reads "qkv", writes "y") with gate/beta/alpha GEMVs (read "hq", write "z"/"beta"/"g").
                     let rows = !self.rows.is_empty();
                     let nn = if (nt == 1 || rows) && dk == 128 { 2 * nk } else { 0 };
                     let at = |n: &str, r: usize, w: usize| p(n) + (4 * r * w) as u64;
-                    if rows {
-                        // One token per slot (`step_rows`): each row has its own conv and recurrent state.
-                        g.batch(&mut || {
+                    g.batch(&mut || {
+                        if rows {
                             for (r, &(sl, _)) in self.rows.iter().enumerate() {
                                 g.conv_silu(at("qkv", r, channels), conv[sl].addr(), conv_w.ptr, at("y", r, channels), channels, c.ssm_conv, nn, eps)?;
                             }
-                            Ok(())
-                        })?;
-                    } else if nt == 1 {
-                        g.conv_silu(p("qkv"), conv[self.cur].addr(), conv_w.ptr, p("y"), channels, c.ssm_conv, nn, eps)?;
-                    } else {
-                        g.conv_seq(p("qkv"), conv[self.cur].addr(), conv_w.ptr, p("y"), channels, c.ssm_conv, nt, sc, ns)?;
-                    }
+                        } else if nt == 1 {
+                            g.conv_silu(p("qkv"), conv[self.cur].addr(), conv_w.ptr, p("y"), channels, c.ssm_conv, nn, eps)?;
+                        } else {
+                            g.conv_seq(p("qkv"), conv[self.cur].addr(), conv_w.ptr, p("y"), channels, c.ssm_conv, nt, sc, ns)?;
+                        }
+                        mv(gate, "h", ne, "z", c.ssm_d_inner)?;
+                        mv2(beta, alpha, "beta", "g")
+                    })?;
                     if nn == 0 { g.l2_norm(p("y"), dk, 2 * nk, channels, nt * 2 * nk, eps)?; }
                     let scale = 1.0 / (dk as f32).sqrt();
                     if rows {
@@ -1212,14 +1210,17 @@ impl<'a> GpuModel<'a> {
                     if !resume { self.prefetch_next(il, &**g, cache, k)?; }
                     // The shared expert's GEMVs and swiglu share batches with the routed ones.
                     if !resume {
-                    g.batch(&mut || {
-                        if let Some(s) = shared {
-                            mv2(router, &s.gate_inp, "rl", "sg")?;
-                            mv2(&s.gate, &s.up, "shg", "shu")?;
-                        } else { mv(router, "h", ne, "rl", c.n_expert)?; }
-                        Ok(())
-                    })?;
-                    g.moe_route(p("rl"), c.n_expert, k, c.expert_weights_scale, lx.table_dev.addr(), ids, p("wts"), slots, p("wh"), p("h"), mb, ne, w.layout.h, step, nt, pid)?;
+                    if let Some(s) = shared {
+                        g.batch(&mut || mv2(router, &s.gate_inp, "rl", "sg"))?;
+                        // Overlap moe_route (1 workgroup reading "rl") with shared expert gate/up GEMVs (reading "hq").
+                        g.batch(&mut || {
+                            g.moe_route(p("rl"), c.n_expert, k, c.expert_weights_scale, lx.table_dev.addr(), ids, p("wts"), slots, p("wh"), p("h"), mb, ne, w.layout.h, step, nt, pid)?;
+                            mv2(&s.gate, &s.up, "shg", "shu")
+                        })?;
+                    } else {
+                        mv(router, "h", ne, "rl", c.n_expert)?;
+                        g.moe_route(p("rl"), c.n_expert, k, c.expert_weights_scale, lx.table_dev.addr(), ids, p("wts"), slots, p("wh"), p("h"), mb, ne, w.layout.h, step, nt, pid)?;
+                    }
                     g.batch(&mut || {
                         if mg.ty == mu.ty && (mg.rows, mg.cols) == (mu.rows, mu.cols) {
                             let pair = (mu.off as i64 - mg.off as i64, p("ue") as i64 - p("ge") as i64);
