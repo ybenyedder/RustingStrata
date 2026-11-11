@@ -19,3 +19,4 @@ pub mod hf;
 pub mod deepseek;
 pub mod gemma4;
 pub mod glm;
+pub mod ngram;

@@ -36,6 +36,28 @@ struct Engine {
     /// [default: calibrated, else 0].
     #[arg(long, value_name = "N", default_missing_value = "1", num_args = 0..=1)]
     mtp: Option<usize>,
+    /// Speculative context-lookup drafter type(s), comma-separated: none, ngram-simple, ngram-map-k, ngram-map-k4v,
+    /// ngram-mod, ngram-cache (mutually exclusive with --mtp).
+    #[arg(long, default_value = "none")]
+    spec_type: String,
+    /// Maximum number of speculative draft tokens verified per step (1..=16).
+    #[arg(long, default_value_t = 16)]
+    spec_draft_n_max: usize,
+    /// N-gram lookup key length in tokens (for ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod).
+    #[arg(long, default_value_t = 12)]
+    spec_ngram_size_n: usize,
+    /// N-gram draft window length in tokens (for ngram-simple, ngram-map-k, ngram-map-k4v).
+    #[arg(long, default_value_t = 48)]
+    spec_ngram_size_m: usize,
+    /// Minimum hit count before drafting (for ngram-map-k, ngram-map-k4v).
+    #[arg(long, default_value_t = 1)]
+    spec_ngram_min_hits: u16,
+    /// Static lookup cache file (llama.cpp binary ngram cache or UTF-8 text scaffold corpus).
+    #[arg(long)]
+    lookup_cache_static: Option<PathBuf>,
+    /// Dynamic lookup cache file loaded at startup and updated/saved across requests.
+    #[arg(long)]
+    lookup_cache_dynamic: Option<PathBuf>,
     /// Sampling temperature; 0 is greedy.
     #[arg(long, default_value_t = 0.0)]
     temp: f32,
@@ -214,7 +236,10 @@ impl Runner<'_> {
         if let Runner::Gpu(g) = self {
             let sum = |f: &dyn Fn(&GpuModel) -> usize| g.parts().map(f).sum::<usize>();
             let st = self.expert_stats().expect("Runner::Gpu has expert stats");
-            if g.drafts.0 > 0 { eprintln!("MTP drafts accepted {}/{} ({:.1}%)", g.drafts.1, g.drafts.0, 100.0 * g.drafts.1 as f64 / g.drafts.0 as f64); }
+            if g.drafts.0 > 0 {
+                let kind = if g.ngram.is_some() { "speculative ngram" } else { "MTP" };
+                eprintln!("{kind} drafts accepted {}/{} ({:.1}%)", g.drafts.1, g.drafts.0, 100.0 * g.drafts.1 as f64 / g.drafts.0 as f64);
+            }
             eprintln!("expert hit rate {:.1}% ({} misses), cache swaps {}", 100.0 * st.hits as f64 / (st.hits + st.misses).max(1) as f64, st.misses, st.swaps);
             // Issue #34 R1: printed on every run, so a fully resident run reads as a measured 0 in the log instead of
             // an absent line. `tokens` counts the token forwards the worker could have been asked about.
@@ -264,8 +289,16 @@ impl Engine {
         let v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         if !v.is_null() { eprintln!("calibration: {}", path.display()); }
         let get = |k: &str| v[k].as_u64().map(|x| x as usize);
+        let ngram_cfg = self.ngram_config()?;
+        if ngram_cfg.is_enabled() && self.mtp.unwrap_or(0) > 0 {
+            anyhow::bail!("--spec-type {} and --mtp {} are mutually exclusive (combo causes severe regression; disable --mtp or set --spec-type none)", self.spec_type, self.mtp.unwrap_or(0));
+        }
         self.chunk.get_or_insert(get("chunk").unwrap_or(4096));
-        self.mtp.get_or_insert(get("mtp").unwrap_or(0));
+        if ngram_cfg.is_enabled() {
+            self.mtp = Some(0);
+        } else {
+            self.mtp.get_or_insert(get("mtp").unwrap_or(0));
+        }
         self.short = get("short").unwrap_or(32);
         // The global pool can be built once; a model loaded later by `serve` keeps the first one's threads.
         if let Some(n) = self.threads.or(get("threads")) { let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global(); }
@@ -284,14 +317,35 @@ impl Engine {
         // shared memory (Vulkan; a no-op elsewhere). No pipeline or model buffer exists yet.
         let types = rusting_strata::gpu_model::gpu_weight_types(&m.w.g);
         for b in &bk { b.preflight(&types, false)?; }
+        let spec_k = if ngram_cfg.is_enabled() && self.parallel <= 1 { ngram_cfg.draft_max } else { self.mtp() };
         let mut g = if self.parallel > 1 {
             GpuModel::load_split(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, 0, self.parallel).context(LOAD_HINT)?
         } else {
-            GpuModel::load_split(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp(), 1).context(LOAD_HINT)?
+            GpuModel::load_split(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, spec_k, 1).context(LOAD_HINT)?
         };
+        if ngram_cfg.is_enabled() && self.parallel <= 1 {
+            let tok = Tokenizer::from_gguf(&m.w.g).ok();
+            g.ngram = Some(rusting_strata::ngram::NgramDrafter::new(ngram_cfg, tok.as_ref())?);
+        }
         g.short = self.short;
         g.cache_ram = self.cache_ram << 20;
         Ok(Runner::Gpu(Box::new(g)))
+    }
+    fn ngram_config(&self) -> anyhow::Result<rusting_strata::ngram::NgramConfig> {
+        let types = rusting_strata::ngram::SpecType::parse_list(&self.spec_type)?;
+        anyhow::ensure!((1..=rusting_strata::cpu_worker::TMAX - 1).contains(&self.spec_draft_n_max),
+            "--spec-draft-n-max {}: must be between 1 and {}", self.spec_draft_n_max, rusting_strata::cpu_worker::TMAX - 1);
+        Ok(rusting_strata::ngram::NgramConfig {
+            types,
+            draft_max: self.spec_draft_n_max,
+            size_n: self.spec_ngram_size_n.max(1),
+            size_m: self.spec_ngram_size_m.max(1),
+            min_hits: self.spec_ngram_min_hits.max(1),
+            mod_n_match: self.spec_ngram_size_n.max(1),
+            mod_n_min: 2,
+            lookup_cache_static: self.lookup_cache_static.clone(),
+            lookup_cache_dynamic: self.lookup_cache_dynamic.clone(),
+        })
     }
     fn sampler(&self) -> Sampler {
         Sampler { temp: self.temp, top_k: self.top_k, top_p: self.top_p, rng: seed(self.seed) }
@@ -1196,14 +1250,19 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
     let eos = tok.eos_ids();
     // `ahead`: the next token when `spec_step` or `step_greedy` already picked it.
     // `start`: the first token whose text is not emitted yet (the text before it ends on a whole character).
-    let (mut out, mut start, mut row, mut ahead) = (Vec::new(), 0, 0, None);
-    while out.len() < n {
+    let (mut out, mut start, mut row, mut ahead, mut stopped) = (Vec::new(), 0, 0, None, false);
+    'outer: while out.len() < n {
         let next = match ahead.take() { Some(t) => t, None => smp.pick(&logits)? as u32 };
-        if eos.contains(&next) { return Ok((out, true)); }
+        if eos.contains(&next) { stopped = true; break; }
         let toks = match r {
             Runner::Gpu(g) if mtp => {
                 let (toks, nx, rw) = g.spec_step(next, row, smp)?;
                 (ahead, row) = (Some(nx), rw);
+                toks
+            }
+            Runner::Gpu(g) if g.ngram.is_some() => {
+                let (toks, nx) = g.ngram_spec_step(next, smp)?;
+                ahead = Some(nx);
                 toks
             }
             // Greedy without MTP: the argmax on the GPU, so only the token id is copied back, not the logits.
@@ -1212,17 +1271,20 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
             _ => { logits = r.step(next)?; vec![next] }
         };
         for t in toks {
-            if eos.contains(&t) { return Ok((out, true)); }
+            if eos.contains(&t) { stopped = true; break 'outer; }
             if out.len() == n { break; }
             out.push(t);
             let s = tok.decode(&out[start..])?;
             if !s.ends_with('\u{fffd}') {
-                if emit(&s)? { return Ok((out, true)); }
+                if emit(&s)? { stopped = true; break 'outer; }
                 start = out.len();
             }
         }
     }
-    Ok((out, false))
+    if let Runner::Gpu(g) = r && let Some(ng) = g.ngram.as_mut() {
+        let _ = ng.save_dynamic();
+    }
+    Ok((out, stopped))
 }
 
 /// Tokens left for a reply: `n`, capped by the context after a `used`-token prompt.
@@ -1411,7 +1473,7 @@ impl Sched {
     /// One forward over the oldest steps (with more than `TMAX` slots decoding, each waits its turn), in slot order
     /// (fewer graphs to capture).
     fn run(&mut self, g: &mut GpuModel) {
-        let mut batch: Vec<_> = self.steps.drain(..self.steps.len().min(rusting_strata::cpu_worker::TMAX)).collect();
+        let mut batch: Vec<_> = self.steps.drain(..self.steps.len().min(4)).collect();
         batch.sort_by_key(|s| s.0);
         self.since = if self.steps.is_empty() { None } else { Some(Instant::now() - Self::GATHER) };
         match g.step_rows(&batch.iter().map(|b| (b.0, b.1, b.2)).collect::<Vec<_>>()) {

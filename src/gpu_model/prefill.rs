@@ -75,7 +75,11 @@ impl Scratch {
 impl GpuModel<'_> {
     /// Run `tokens` from the current position; returns the logits after the last one. Short prompts (and models
     /// loaded without a prefill chunk) go through the decode step.
-    pub fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> { self.prefill_with(tokens, &mut |_| Ok(())) }
+    pub fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+        let r = self.prefill_with(tokens, &mut |_| Ok(()))?;
+        if let Some(ng) = self.ngram.as_mut() { ng.begin(tokens); }
+        Ok(r)
+    }
 
     /// `prefill`, calling `between` between two chunks (`serve --parallel` decodes the other slots there; it must
     /// leave the current slot's state alone).
@@ -171,7 +175,9 @@ impl GpuModel<'_> {
             self.save_state()?;
             (self.saved_ids, self.saved_owner) = (tokens[..keep].to_vec(), own);
         }
-        Ok((self.prefill_with(&tokens[keep..], between)?, reused))
+        let logits = self.prefill_with(&tokens[keep..], between)?;
+        if let Some(ng) = self.ngram.as_mut() { ng.begin(tokens); }
+        Ok((logits, reused))
     }
 
     fn step_all(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {

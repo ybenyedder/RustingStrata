@@ -137,6 +137,11 @@ struct Seq { pos: usize, saved: Vec<(Buf, Buf)>, saved_pos: usize, saved_ids: Ve
 /// See `GpuModel::sys`.
 type Stash = (Vec<Vec<u8>>, usize, [i64; 2], Vec<u32>);
 
+/// Maximum number of intermediate DeltaNet + conv state snapshots written during a multi-token verify pass.
+/// Any rollback with `keep <= SNAP_MAX` restores directly via `dtod`; `keep > SNAP_MAX` restores `snap[SNAP_MAX - 1]`
+/// and replays the remaining `keep - SNAP_MAX` accepted tokens in one batch pass.
+pub const SNAP_MAX: usize = 8;
+
 pub struct GpuModel<'a> {
     m: &'a Model<'a>,
     pub gpu: Box<dyn Backend>,
@@ -214,6 +219,8 @@ pub struct GpuModel<'a> {
     /// Prefill scratch (None: prompts go through `step`).
     pf: Option<prefill::Scratch>,
     mtp: Option<MtpHead>,
+    /// Speculative N-gram / lookup cache drafter (mutually exclusive with `mtp`).
+    pub ngram: Option<crate::ngram::NgramDrafter>,
     /// The layers of this part are `first..first + layers.len()`.
     first: usize,
     /// The part on the next device of a model split by layers (`load_split`): this part's hidden state goes to it
@@ -297,8 +304,9 @@ impl<'a> GpuModel<'a> {
         let ring = gpu.zeros::<f32>(if qsa_on { c.n_layer * QSA_RING } else { 1 })?;
 
         // ponytail: no MTP or batched prefill with hyper-connections yet (their state and row layouts assume one stream).
-        let k = if c.n_nextn > 0 && c.hc_n == 0 { k.min(TMAX - 1) } else { 0 };
-        let mtp = k > 0;
+        let k = if c.hc_n == 0 { k.min(TMAX - 1) } else { 0 };
+        let mtp = k > 0 && c.n_nextn > 0;
+        let nsnap = k.min(SNAP_MAX);
         let load_layer = |il: usize, kind: LayerKind| -> anyhow::Result<Layer> {
             let mixer = if kind == LayerKind::Delta {
                 Mixer::Delta {
@@ -307,7 +315,7 @@ impl<'a> GpuModel<'a> {
                     conv_w: lt(il, "ssm_conv1d.weight")?, norm: lt(il, "ssm_norm.weight")?, out: lt(il, "ssm_out.weight")?,
                     conv: (0..ns).map(|_| gpu.zeros::<f32>((c.ssm_conv - 1) * channels)).collect::<anyhow::Result<_>>()?,
                     s: (0..ns).map(|_| gpu.zeros::<f32>(nv * c.ssm_dv() * dk)).collect::<anyhow::Result<_>>()?,
-                    snap: if mtp { Some((gpu.zeros::<f32>(k * (c.ssm_conv - 1) * channels)?, gpu.zeros::<f32>(k * c.ssm_d_inner * dk)?)) } else { None },
+                    snap: if nsnap > 0 { Some((gpu.zeros::<f32>(nsnap * (c.ssm_conv - 1) * channels)?, gpu.zeros::<f32>(nsnap * c.ssm_d_inner * dk)?)) } else { None },
                 }
             } else {
                 Mixer::Attn {
@@ -443,7 +451,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None,
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, ngram: None, first: range.start, next: None,
                       cur: 0, seqs, rows: vec![], row_tokens: 0 })
     }
 
@@ -452,6 +460,7 @@ impl<'a> GpuModel<'a> {
         self.saved_ids.clear();
         self.sys = None;
         if let Some(h) = self.mtp.as_mut() { h.pos = 0; h.pend.clear(); }
+        if let Some(ng) = self.ngram.as_mut() { ng.reset(); }
         for l in self.layers.iter().chain(self.mtp.as_ref().map(|h| &h.layer)) {
             match &l.mixer {
                 Mixer::Delta { conv, s, .. } => { self.gpu.memset(&conv[self.cur])?; self.gpu.memset(&s[self.cur])?; }
@@ -496,7 +505,7 @@ impl<'a> GpuModel<'a> {
     /// and attention regimes, so keep the rows in slot order.
     pub fn step_rows(&mut self, rows: &[(usize, u32, bool)]) -> anyhow::Result<Vec<(u32, Vec<f32>)>> {
         let (nt, nvoc) = (rows.len(), self.m.cfg.n_vocab);
-        ensure!((1..=TMAX).contains(&nt) && self.mtp.is_none(), "step_rows: {nt} rows");
+        ensure!((1..=4).contains(&nt) && self.mtp.is_none(), "step_rows: {nt} rows");
         let pos: Vec<usize> = rows.iter().map(|&(s, ..)| *self.slot_pos(s)).collect();
         if pos.iter().any(|&p| p >= self.ctx) { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
         self.put_embed(&rows.iter().map(|r| r.1).collect::<Vec<_>>())?;
@@ -534,7 +543,6 @@ impl<'a> GpuModel<'a> {
         let seq = self.begin_seq();
         self.gpu.put(&pos.iter().flat_map(|&p| [p as i32, seq as i32]).collect::<Vec<_>>(), &self.step_buf, 0)?;
         self.rows = rows.iter().zip(pos).map(|(r, &p)| (r.0, p)).collect();
-        const _: () = assert!(TMAX <= 4, "step_rows graph key");
         let mut key = 1 << 63 | nt as u64;
         for (r, &(sl, p)) in self.rows.iter().enumerate() { key |= (sl as u64) << (8 + 8 * r) | ((gq_min(p, 1) == 0) as u64) << (48 + r); }
         if self.m.loras.is_empty() { self.gpu.graph(key, &mut || self.forward(nt, 0, None))?; } else { self.forward(nt, 0, None)?; }
@@ -785,7 +793,8 @@ impl<'a> GpuModel<'a> {
     /// Keep only the first `keep` tokens of the last `verify`, which started at position `start` (1 <= keep <= `k`):
     /// recurrent states come from the snapshots it wrote, KV entries past them are dropped by rewinding `pos`.
     pub fn rollback(&mut self, start: usize, keep: usize) -> anyhow::Result<()> {
-        if !(1..=self.k).contains(&keep) || start + keep > self.pos { bail!("rollback: keep {keep} of verify at {start}"); }
+        let nsnap = self.k.min(SNAP_MAX);
+        if !(1..=nsnap).contains(&keep) || start + keep > self.pos { bail!("rollback: keep {keep} of verify at {start}"); }
         let g = &self.gpu;
         for l in &self.layers {
             if let Mixer::Delta { conv, s, snap: Some((sc, ss)), .. } = &l.mixer {
@@ -797,7 +806,25 @@ impl<'a> GpuModel<'a> {
             }
         }
         self.pos = start + keep;
+        if let Some(n) = self.next.as_mut() { n.rollback(start, keep)?; }
         Ok(())
+    }
+
+    /// Keep the first `keep` tokens (`1 <= keep < toks.len()`) of a `verify` that started at `start`.
+    /// When `keep <= SNAP_MAX`, restores the recurrent snapshot directly (`dtod`); when `keep > SNAP_MAX`,
+    /// restores snapshot `SNAP_MAX` and replays `&toks[SNAP_MAX..keep]` in one forward pass.
+    pub fn rollback_tokens(&mut self, start: usize, keep: usize, toks: &[u32]) -> anyhow::Result<()> {
+        let nsnap = self.k.min(SNAP_MAX);
+        if keep <= nsnap {
+            return self.rollback(start, keep);
+        }
+        self.rollback(start, nsnap)?;
+        let rem = &toks[nsnap..keep];
+        self.verify_run(rem)?;
+        let t = self.tail();
+        let _ = t.finish(rem.len(), gq_min(self.pos, rem.len()), None)?;
+        t.gpu.sync()?;
+        self.after_forward(rem.len())
     }
 
     /// Return to the state of the last `save_state`.
@@ -971,6 +998,52 @@ impl<'a> GpuModel<'a> {
         Ok((toks, next, n))
     }
 
+    /// Speculative decode with context N-gram / lookup cache drafting (`NgramDrafter`).
+    /// When no N-gram match is found (`draft.is_empty()`), executes a normal 1-token decode step (`step_greedy` or `step`)
+    /// with zero GPU overhead. When `m > 0` draft tokens are proposed, verifies `[t, draft..]` in a single pass and
+    /// rolls back any rejected suffix via `rollback_tokens`.
+    pub fn ngram_spec_step(&mut self, t: u32, smp: &mut Sampler) -> anyhow::Result<(Vec<u32>, u32)> {
+        let room = self.ctx.saturating_sub(self.pos + 1).min(self.k);
+        let draft = match self.ngram.as_mut() {
+            Some(ng) if room > 0 => ng.draft(t, room),
+            _ => Vec::new(),
+        };
+        if draft.is_empty() {
+            if let Some(ng) = self.ngram.as_mut() { ng.accept(&[t]); }
+            let next = if smp.temp <= 0.0 {
+                self.step_greedy(t)?
+            } else {
+                smp.pick(&self.step(t)?)? as u32
+            };
+            return Ok((vec![t], next));
+        }
+        let m = draft.len();
+        let mut toks = Vec::with_capacity(1 + m);
+        toks.push(t);
+        toks.extend_from_slice(&draft);
+        let start = self.pos;
+        let (n, next) = if smp.temp <= 0.0 {
+            self.verify_greedy(&toks, |am| (0..m).take_while(|&i| am[i] == toks[i + 1]).count())?
+        } else {
+            let l = self.verify(&toks)?;
+            let mut n = 0;
+            loop {
+                if n == m { break (n, smp.pick(&l[n])? as u32); }
+                match smp.accept(&l[n], toks[n + 1] as usize)? { None => n += 1, Some(x) => break (n, x as u32) }
+            }
+        };
+        self.drafts.0 += m;
+        self.drafts.1 += n;
+        if n < m {
+            self.rollback_tokens(start, n + 1, &toks)?;
+        }
+        toks.truncate(n + 1);
+        if let Some(ng) = self.ngram.as_mut() {
+            ng.accept(&toks);
+        }
+        Ok((toks, next))
+    }
+
     /// Address of hidden row `row` of the last `step` or `verify`.
     fn row_ptr(&self, row: usize) -> u64 { self.x.addr() + 4 * (row * self.m.cfg.n_embd) as u64 }
 
@@ -1090,7 +1163,7 @@ impl<'a> GpuModel<'a> {
             }
             match &l.mixer {
                 Mixer::Delta { qkv, gate, beta, alpha, dt_bias, a, conv_w, norm, out, conv, s, snap } => {
-                    let (sc, ss, ns) = snap.as_ref().map_or((0, 0, 0), |(a, b)| (a.addr(), b.addr(), self.k));
+                    let (sc, ss, ns) = snap.as_ref().map_or((0, 0, 0), |(a, b)| (a.addr(), b.addr(), self.k.min(SNAP_MAX)));
                     mv(qkv, "h", ne, "qkv", channels)?;
                     // One token with 128-wide heads: conv_silu also does the q and k l2 norms.
                     // Overlap conv_silu/conv_seq (reads "qkv", writes "y") with gate/beta/alpha GEMVs (read "hq", write "z"/"beta"/"g").
