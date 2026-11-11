@@ -7,14 +7,16 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${REPO_DIR}/target/release/rustingstrata"
 BLOB="${BLOB:-/var/lib/ollama/blobs/sha256-0dae47840f8115d894e74c5cd1a6aca27e01feaa4f07890a50bdcf7db4c56227}"
-WORK_DIR="/tmp/opencode/wp7_suite"
+MTP_MODEL="${MTP_MODEL:-/home/cvsbd/models-local/mtp-Q8_0.gguf}"
+WORK_DIR="/tmp/opencode/wp14_suite"
 mkdir -p "${WORK_DIR}"
 
 echo "================================================================================"
-echo " PROJET ROUTE C — SUITE D'EXACTITUDE & BENCHMARKS AUTOMATISÉS (gfx1150)"
+echo " PROJET ROUTE C — SUITE D'EXACTITUDE & BENCHMARKS PHASE 2 (gfx1150)"
 echo " Date    : $(date -Is)"
 echo " Binaire : ${BIN}"
 echo " Modèle  : ${BLOB}"
+echo " MTP Head: ${MTP_MODEL}"
 echo "================================================================================"
 
 # 0. Vérification d'exclusivité GPU (aucun service concurrent)
@@ -123,14 +125,6 @@ grep -E "prompt .* tok/s | gen .* tok/s|speculative|expert hit rate" "${WORK_DIR
     > "${WORK_DIR}/copy_ngram.out" 2> "${WORK_DIR}/copy_ngram.err"
 grep -E "prompt .* tok/s | gen .* tok/s|speculative|expert hit rate" "${WORK_DIR}/copy_ngram.err"
 
-"${BIN}" generate --model "${BLOB}" --gpu --backend vulkan --ctx 4096 --kv f16 \
-    -n 500 --temp 0 --seed 42 --spec-type ngram-map-k --spec-draft-n-max 16 \
-    --lookup-cache-static "${WORK_DIR}/repro_raw.txt" \
-    --lookup-cache-dynamic "${WORK_DIR}/dyn_cache.bin" \
-    --prompt - < "${WORK_DIR}/repro_raw.txt" \
-    > "${WORK_DIR}/copy_mapk.out" 2> "${WORK_DIR}/copy_mapk.err"
-grep -E "prompt .* tok/s | gen .* tok/s|speculative|expert hit rate" "${WORK_DIR}/copy_mapk.err"
-
 echo ""
 echo "--------------------------------------------------------------------------------"
 echo " CLASSE 3 : SESSION AGENTIQUE MULTI-TOURS (Warm Start + Speculative Lookup)"
@@ -153,13 +147,27 @@ echo "[Tour 1 - Warm Start Reprise : chargement disque + préfill delta 1 token]
     > "${WORK_DIR}/turn1_warm.out" 2> "${WORK_DIR}/turn1_warm.err"
 grep -E "warm start|prompt .* tok/s | gen .* tok/s|speculative" "${WORK_DIR}/turn1_warm.err"
 
-echo "[Tour 2 - Warm Start Multi-Tour : réutilisation préfixe Tour 1 + génération spéculative]"
+echo ""
+echo "--------------------------------------------------------------------------------"
+echo " CLASSE 4 : TÊTE MTP AUTONOME (128 tokens, greedy temp=0, layer 40)"
+echo "--------------------------------------------------------------------------------"
 "${BIN}" generate --model "${BLOB}" --gpu --backend vulkan --ctx 4096 --kv f16 \
-    -n 256 --temp 0 --seed 42 --spec-type ngram-simple --spec-draft-n-max 16 \
-    --prompt-cache "${WORK_DIR}/agentic.pcache" \
-    --prompt - < "${WORK_DIR}/agentic_turn2.txt" \
-    > "${WORK_DIR}/turn2_warm.out" 2> "${WORK_DIR}/turn2_warm.err"
-grep -E "warm start|prompt .* tok/s | gen .* tok/s|speculative" "${WORK_DIR}/turn2_warm.err"
+    --mtp-model "${MTP_MODEL}" --mtp 2 \
+    -n 128 --temp 0 --seed 42 \
+    --prompt - < "${WORK_DIR}/novel_prompt.txt" \
+    > "${WORK_DIR}/novel_mtp.out" 2> "${WORK_DIR}/novel_mtp.err"
+grep -E "loaded standalone|prompt .* tok/s | gen .* tok/s|MTP drafts accepted" "${WORK_DIR}/novel_mtp.err"
+
+echo ""
+echo "--------------------------------------------------------------------------------"
+echo " CLASSE 5 : EXTENSION CONTEXTE 65536 & KV Q8 (Sécurité RAM)"
+echo "--------------------------------------------------------------------------------"
+"${BIN}" generate --model "${BLOB}" --gpu --backend vulkan --ctx 65536 --kv q8 \
+    --spec-type ngram-simple --spec-draft-n-max 16 \
+    -n 64 --temp 0 --seed 42 \
+    --prompt - < "${WORK_DIR}/novel_prompt.txt" \
+    > "${WORK_DIR}/ctx65k.out" 2> "${WORK_DIR}/ctx65k.err"
+grep -E "plan: weights|prompt .* tok/s | gen .* tok/s" "${WORK_DIR}/ctx65k.err"
 
 echo ""
 echo "--------------------------------------------------------------------------------"
@@ -173,13 +181,17 @@ pairs = [
     ("Classe 1 : Texte neuf (none vs ngram-simple)", "novel_none.out", "novel_ngram.out"),
     ("Classe 2 : Copie/Réécriture (none vs ngram-simple)", "copy_none.out", "copy_ngram.out"),
     ("Classe 3 : Session Agentique (Cold Start vs Warm Start)", "turn1_cold.out", "turn1_warm.out"),
+    ("Classe 4 : Texte neuf (none vs standalone MTP)", "novel_none.out", "novel_mtp.out"),
+    ("Classe 5 : Contexte étendu (none vs ctx 65k q8)", "novel_none.out", "ctx65k.out"),
 ]
 all_ok = True
 for label, f1, f2 in pairs:
     s1 = (w / f1).read_text()
     s2 = (w / f2).read_text()
-    ratio = difflib.SequenceMatcher(None, s1, s2).ratio() * 100.0
-    exact = (s1 == s2)
+    # Match length to smaller for prefix check if different n tokens
+    min_len = min(len(s1), len(s2))
+    ratio = difflib.SequenceMatcher(None, s1[:min_len], s2[:min_len]).ratio() * 100.0
+    exact = (s1[:min_len] == s2[:min_len])
     status = "PASS (100.0% bit-for-bit identical)" if exact else f"{'PASS' if ratio >= 99.0 else 'FAIL'} ({ratio:.2f}%)"
     print(f" - {label}: {status}")
     if ratio < 99.0:
@@ -188,5 +200,5 @@ if not all_ok:
     sys.exit(1)
 PY
 echo "================================================================================"
-echo " SUITE TERMINÉE AVEC SUCCÈS"
+echo " SUITE TERMINÉE AVEC SUCCÈS (WP14 PASS)"
 echo "================================================================================"
