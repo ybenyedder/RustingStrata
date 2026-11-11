@@ -109,7 +109,13 @@ impl<'a> Model<'a> {
             eprintln!("note: the MTP (nextn) layer has a quant type this engine does not support; loading without MTP");
             cfg.n_nextn = 0;
         }
-        w.get("token_embd.weight")?;
+        let emb_t = w.get("token_embd.weight")?;
+        // Pre-touch mmap pages of token_embd.weight so decode step put_embed() never stalls on SSD page faults.
+        let mut _touch = 0u8;
+        for off in (0..emb_t.data.len()).step_by(4096) {
+            _touch ^= unsafe { std::ptr::read_volatile(&emb_t.data[off]) };
+        }
+        std::hint::black_box(_touch);
         let ple = if cfg.n_embd_ple > 0 {
             let p = |k: &str| format!("{}.ple.{k}", cfg.arch);
             let arr = |k: &str| -> anyhow::Result<Vec<u64>> {

@@ -23,10 +23,13 @@ void main() {
             uint o = t * p.k + lane;
             int s = p.table.v[id];
             p.ids.v[o] = id; p.wts.v[o] = w; p.slots.v[o] = s; p.wh.v[o] = s >= 0 ? w : 0.0;
-            p.mb.v[32 + o] = uint(id); p.mb.v[32 + kt + o] = floatBitsToUint(w); p.mb.v[32 + 2 * kt + o] = uint(s);
-            if (s < 0) miss = true;
+            if (uint64_t(p.mb) != 0) {
+                p.mb.v[32 + o] = uint(id); p.mb.v[32 + kt + o] = floatBitsToUint(w); p.mb.v[32 + 2 * kt + o] = uint(s);
+                if (s < 0) miss = true;
+            }
         }
     }
+    if (uint64_t(p.mb) == 0) return;
     barrier();
     if (miss) for (uint i = gl_LocalInvocationID.x; i < p.nh * p.T; i += 256) p.mb.v[p.h_off + i] = floatBitsToUint(p.h.v[i]);
     if (gl_LocalInvocationID.x == 0) { p.mb.v[1] = p.T; p.mb.v[8] = 0; }  // word 8: the combine's verdict (mb_wait)

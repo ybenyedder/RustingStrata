@@ -179,12 +179,16 @@ struct State {
     spare: Vec<vk::CommandBuffer>,
     /// Submitted since the last wait.
     used: Vec<vk::CommandBuffer>,
+    /// Closed command buffers and graph replays queued in execution order for the next `submit`.
+    queued: Vec<vk::CommandBuffer>,
     /// The open command buffer.
     cur: Option<vk::CommandBuffer>,
     /// The command buffer with conditional rendering on (`cond_on`), ended before the buffer is.
     cond: Option<vk::CommandBuffer>,
     /// Conditional rendering failed the self-test in `Vk::new`: not used.
     no_cond: bool,
+    /// Set by `skip_rest` when a non-fast-path MoE combine (`mb != 0`) uses conditional rendering.
+    need_cond: bool,
     /// A MoE combine gave up waiting for the CPU worker since the last `stalled` (see `Backend::stalled`).
     stalled: bool,
     /// Work was submitted since the last wait.
@@ -441,7 +445,7 @@ impl Vk {
         let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None) }?;
         let pc = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(128)];
         let layout = unsafe { dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc), None) }?;
-        let st = State { pool, spare: vec![], used: vec![], cur: None, cond: None, no_cond: false, stalled: false, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false, beside: false, tpool, tcur: None,
+        let st = State { pool, spare: vec![], used: vec![], queued: vec![], cur: None, cond: None, no_cond: false, need_cond: false, stalled: false, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false, beside: false, tpool, tcur: None,
             tspare: vec![], tused: vec![], tbytes: 0, tstart: 0, tring: Default::default(), cstaged: false, cval: 0, tval: 0, bwait: 0, twait: 0, tlag: 0,
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
@@ -541,7 +545,7 @@ impl Inner {
         unsafe { self.dev.begin_command_buffer(c, &vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)) }?;
         st.cur = Some(c);
-        self.cond_on(st, c);
+        if st.need_cond { self.cond_on(st, c); }
         Ok(c)
     }
 
@@ -560,6 +564,7 @@ impl Inner {
     /// while the error word is 0, so nothing after a combine that gave up runs until the host has seen it (no-op
     /// without conditional rendering). Every compute command buffer starts this way too, for the submissions after.
     fn skip_rest(&self, st: &mut State) -> anyhow::Result<()> {
+        st.need_cond = true;
         let cb = self.cb(st)?;
         self.end_cond(st, cb);
         self.cond_on(st, cb);
@@ -586,17 +591,23 @@ impl Inner {
         }
     }
 
-    /// Submit the open command buffer, then `graph`; with `wait`, wait for all submitted work.
-    fn submit(&self, st: &mut State, graph: Option<vk::CommandBuffer>, wait: bool) -> anyhow::Result<()> {
-        let mut cbs = vec![];
+    /// Close `st.cur` if open and append it (plus `graph` if given) to `st.queued` in order.
+    fn enqueue_cb(&self, st: &mut State, graph: Option<vk::CommandBuffer>) -> anyhow::Result<()> {
         if let Some(c) = st.cur.take() {
             st.copied.1 = 0;
             self.end_cond(st, c);
             unsafe { self.dev.end_command_buffer(c) }?;
             st.used.push(c);
-            cbs.push(c);
+            st.queued.push(c);
         }
-        cbs.extend(graph);
+        st.queued.extend(graph);
+        Ok(())
+    }
+
+    /// Submit the open command buffer, then `graph`; with `wait`, wait for all submitted work.
+    fn submit(&self, st: &mut State, graph: Option<vk::CommandBuffer>, wait: bool) -> anyhow::Result<()> {
+        self.enqueue_cb(st, graph)?;
+        let cbs = std::mem::take(&mut st.queued);
         if cbs.is_empty() && !(wait && st.busy) { return Ok(()); }
         let fence = if wait { st.fence } else { vk::Fence::null() };
         st.cval += 1;
@@ -653,6 +664,7 @@ impl Inner {
             let used = std::mem::take(&mut st.used);
             st.spare.extend(used);
             st.busy = false;
+            st.need_cond = false;
             st.staged = 0;
             if !e.is_null() { unsafe { e.add(1).write_volatile(0) }; }
             if !e.is_null() && unsafe { e.read_volatile() } != 0 {
@@ -1083,14 +1095,14 @@ impl Backend for Vk {
     }
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
         let mut st = self.0.st();
-        if let Some(&g) = st.graphs.get(&key) { return self.0.submit(&mut st, Some(g), false); }
+        if let Some(&g) = st.graphs.get(&key) { return self.0.enqueue_cb(&mut st, Some(g)); }
         if std::env::var_os("STRATA_NO_GRAPH").is_some() { drop(st); return f(); }
         let c = unsafe { self.0.dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(st.gpool)
             .command_buffer_count(1)) }?[0];
         unsafe { self.0.dev.begin_command_buffer(c, &vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE)) }?;
         st.rec = Some(c);
-        self.0.cond_on(&mut st, c);
+        if st.need_cond { self.0.cond_on(&mut st, c); }
         drop(st);
         let r = f();
         let mut st = self.0.st();
@@ -1099,8 +1111,10 @@ impl Backend for Vk {
         unsafe { self.0.dev.end_command_buffer(c) }?;
         if let Err(e) = r { unsafe { self.0.dev.free_command_buffers(st.gpool, &[c]) }; return Err(e); }
         st.graphs.insert(key, c);
-        self.0.submit(&mut st, Some(c), false)
+        self.0.enqueue_cb(&mut st, Some(c))
     }
+
+    fn moe_mailbox_optional(&self) -> bool { true }
 
     /// Device memory mapped through the BAR (`BAR`, or `BAR_AMD`).
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)> {
