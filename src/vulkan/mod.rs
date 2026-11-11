@@ -164,6 +164,8 @@ struct Inner {
     /// `maxComputeSharedMemorySize` of the device (or STRATA_VK_SMEM_LIMIT, a test hook): no pipeline may need more
     /// `Workgroup` bytes than this (`Vk::pipeline`), or the driver accepts it and faults at dispatch (Xid 13 on Volta).
     smem_limit: u32,
+    /// Nanoseconds per GPU timestamp tick (`VkPhysicalDeviceLimits::timestampPeriod`).
+    ts_period: f32,
     /// STRATA_VK_STATS: print the driver's statistics (registers, ...) of each pipeline as it is created.
     stats: bool,
     /// The one pipeline layout: a 128-byte push constant range (the Vulkan minimum), no descriptor sets.
@@ -257,9 +259,14 @@ impl Drop for Inner {
     fn drop(&mut self) {
         let st = self.st.get_mut().unwrap_or_else(|e| e.into_inner());
         if let Some((_, _, tot)) = &st.prof {
+            let scale = self.ts_period as f64;
             let mut v: Vec<_> = tot.iter().collect(); v.sort_by_key(|x| std::cmp::Reverse(x.1.0));
-            let all: u64 = v.iter().map(|x| x.1.0).sum();
-            for (n, (ns, c)) in v { eprintln!("prof {n:16} {:9.1} ms {:5.1}% {c:7} calls {:8.2} us", *ns as f64 / 1e6, *ns as f64 * 100.0 / all as f64, *ns as f64 / 1e3 / *c as f64); }
+            let all: f64 = v.iter().filter(|(k, _)| **k != "_barrier_gap").map(|x| x.1.0 as f64 * scale).sum();
+            eprintln!("vulkan prof (timestampPeriod = {:.2} ns, active kernel sum = {:.2} ms):", self.ts_period, all / 1e6);
+            for (n, (ticks, c)) in v {
+                let ns = *ticks as f64 * scale;
+                eprintln!("prof {n:24} {:9.2} ms {:5.1}% {c:7} calls {:8.2} us", ns / 1e6, ns * 100.0 / all.max(1.0), ns / 1e3 / (*c).max(1) as f64);
+            }
         }
         unsafe {
             let _ = self.dev.device_wait_idle();
@@ -439,7 +446,8 @@ impl Vk {
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, wave64, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), smem_limit, stats, layout, st: Mutex::new(st) };
+        let ts_period = limits.timestamp_period;
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, wave64, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -631,7 +639,16 @@ impl Inner {
             if let Some((qp, names, tot)) = &mut st.prof { if !names.is_empty() {
                 let mut t = vec![0u64; 2 * names.len()];
                 unsafe { self.dev.get_query_pool_results(*qp, 0, &mut t, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT) }?;
-                for (i, n) in names.drain(..).enumerate() { let e = tot.entry(n).or_default(); e.0 += t[2 * i + 1] - t[2 * i]; e.1 += 1; }
+                for (i, n) in names.drain(..).enumerate() {
+                    let e = tot.entry(n).or_default();
+                    e.0 += t[2 * i + 1].saturating_sub(t[2 * i]);
+                    e.1 += 1;
+                    if i > 0 && t[2 * i] >= t[2 * i - 1] {
+                        let g = tot.entry("_barrier_gap").or_default();
+                        g.0 += t[2 * i] - t[2 * i - 1];
+                        g.1 += 1;
+                    }
+                }
             } }
             let used = std::mem::take(&mut st.used);
             st.spare.extend(used);
@@ -779,7 +796,19 @@ impl Vk {
         }
         if !st.batch || name == "quant_xq" { self.0.barrier(cb, false); }
         if st.rec.is_none() { if let Some((qp, names, _)) = &mut st.prof { if names.len() < 32767 {
-            unsafe { d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, *qp, 2 * names.len() as u32 + 1) }; names.push(name); } } }
+            let label = match (name, spec.get(1).copied()) {
+                ("gemv_q", Some(11)) => "gemv_q:Q3_K",
+                ("gemv_q", Some(13)) => "gemv_q:Q5_K",
+                ("gemv_q", Some(14)) => "gemv_q:Q6_K",
+                ("gemv_q", Some(8)) => "gemv_q:Q8_0",
+                ("gemv_q", Some(18)) => "gemv_q:IQ3_XXS",
+                ("moe_gemv_q", Some(18)) => "moe_gemv_q:IQ3_XXS",
+                ("moe_gemv_q", Some(11)) => "moe_gemv_q:Q3_K",
+                ("moe_down_combine", Some(18)) => "moe_down_combine:IQ3_XXS",
+                ("moe_down_combine", Some(11)) => "moe_down_combine:Q3_K",
+                _ => name,
+            };
+            unsafe { d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, *qp, 2 * names.len() as u32 + 1) }; names.push(label); } } }
         Ok(())
     }
 

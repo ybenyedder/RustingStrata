@@ -591,14 +591,24 @@ impl<'a> GpuModel<'a> {
     /// Run one token; returns logits over the vocabulary.
     pub fn step(&mut self, token: u32) -> anyhow::Result<Vec<f32>> {
         if self.pos >= self.ctx { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
+        let prof = std::env::var_os("STRATA_VK_PROF").is_some();
+        let t0 = prof.then(std::time::Instant::now);
         let seq = self.begin_seq();
         self.put_embed(&[token])?;
         self.gpu.put(&[self.pos as i32, seq as i32], &self.step_buf, 0)?;
+        let t1 = prof.then(std::time::Instant::now);
         self.pass(1)?;
+        let t2 = prof.then(std::time::Instant::now);
         let t = self.tail();
         let mut logits = t.gpu.get::<f32>(&t.logits, 0, self.m.cfg.n_vocab)?;
         if t.finish(1, gq_min(self.pos, 1), None)? { logits = t.gpu.get::<f32>(&t.logits, 0, self.m.cfg.n_vocab)?; }
+        let t3 = prof.then(std::time::Instant::now);
         self.after_forward(1)?;
+        if let (Some(t0), Some(t1), Some(t2), Some(t3)) = (t0, t1, t2, t3) {
+            let t4 = std::time::Instant::now();
+            eprintln!("step_prof pos={}: embed_htod={:.1}us pass_submit={:.1}us gpu_wait_dtoh={:.1}us after_experts={:.1}us total={:.1}us",
+                self.pos, (t1 - t0).as_secs_f64() * 1e6, (t2 - t1).as_secs_f64() * 1e6, (t3 - t2).as_secs_f64() * 1e6, (t4 - t3).as_secs_f64() * 1e6, (t4 - t0).as_secs_f64() * 1e6);
+        }
         Ok(logits)
     }
 
@@ -622,7 +632,15 @@ impl<'a> GpuModel<'a> {
     /// `verify` for greedy speculation: `keep` gets the argmax of every row; returns its row n and that row's argmax.
     fn verify_greedy(&mut self, tokens: &[u32], keep: impl FnOnce(&[u32]) -> usize) -> anyhow::Result<(usize, u32)> {
         let (nt, nvoc) = (tokens.len(), self.m.cfg.n_vocab);
-        self.verify_run(tokens)?;
+        let prof = std::env::var_os("STRATA_VK_PROF").is_some();
+        let t0 = prof.then(std::time::Instant::now);
+        let seq = self.begin_seq();
+        self.put_embed(tokens)?;
+        let steps: Vec<i32> = (0..nt).flat_map(|t| [(self.pos + t) as i32, seq as i32]).collect();
+        self.gpu.put(&steps, &self.step_buf, 0)?;
+        let t1 = prof.then(std::time::Instant::now);
+        self.pass(nt)?;
+        let t2 = prof.then(std::time::Instant::now);
         let t = self.tail();
         let g = &t.gpu;
         g.argmax_rows(t.logits.addr(), nvoc, nt, t.amax.addr())?;
@@ -632,7 +650,13 @@ impl<'a> GpuModel<'a> {
             am = g.get::<i32>(&t.amax, 0, nt)?.into_iter().map(|x| x as u32).collect();
         }
         let n = keep(&am);
+        let t3 = prof.then(std::time::Instant::now);
         self.after_forward(nt)?;
+        if let (Some(t0), Some(t1), Some(t2), Some(t3)) = (t0, t1, t2, t3) {
+            let t4 = std::time::Instant::now();
+            eprintln!("greedy_prof pos={}: embed_htod={:.1}us pass_submit={:.1}us gpu_wait_dtoh={:.1}us after_experts={:.1}us total={:.1}us",
+                self.pos, (t1 - t0).as_secs_f64() * 1e6, (t2 - t1).as_secs_f64() * 1e6, (t3 - t2).as_secs_f64() * 1e6, (t4 - t3).as_secs_f64() * 1e6, (t4 - t0).as_secs_f64() * 1e6);
+        }
         Ok((n, am[n]))
     }
 
