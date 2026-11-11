@@ -58,6 +58,9 @@ struct Engine {
     /// Dynamic lookup cache file loaded at startup and updated/saved across requests.
     #[arg(long)]
     lookup_cache_dynamic: Option<PathBuf>,
+    /// Persistent disk cache file for KV and recurrent prefix states (Warm Start across requests and restarts).
+    #[arg(long)]
+    prompt_cache: Option<PathBuf>,
     /// Sampling temperature; 0 is greedy.
     #[arg(long, default_value_t = 0.0)]
     temp: f32,
@@ -329,6 +332,14 @@ impl Engine {
         }
         g.short = self.short;
         g.cache_ram = self.cache_ram << 20;
+        if let Some(p) = &self.prompt_cache {
+            if g.cache_ram == 0 {
+                g.cache_ram = 2048 << 20;
+            }
+            if let Err(e) = g.load_prompt_cache(p) {
+                eprintln!("warning: could not load prompt cache {}: {e:#}", p.display());
+            }
+        }
         Ok(Runner::Gpu(Box::new(g)))
     }
     fn ngram_config(&self) -> anyhow::Result<rusting_strata::ngram::NgramConfig> {

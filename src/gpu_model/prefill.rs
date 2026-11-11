@@ -76,6 +76,18 @@ impl GpuModel<'_> {
     /// Run `tokens` from the current position; returns the logits after the last one. Short prompts (and models
     /// loaded without a prefill chunk) go through the decode step.
     pub fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+        if self.prompt_cache_path.is_some() && self.pos == 0 && tokens.len() > 1 {
+            let t0 = std::time::Instant::now();
+            let (logits, reused) = self.prefill_cached(tokens, 0, tokens.len() - 1)?;
+            if reused > 0 {
+                eprintln!(
+                    "warm start: reused {reused}/{} prompt tokens from cache (TTFT {:.1} ms)",
+                    tokens.len(),
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            return Ok(logits);
+        }
         let r = self.prefill_with(tokens, &mut |_| Ok(()))?;
         if let Some(ng) = self.ngram.as_mut() { ng.begin(tokens); }
         Ok(r)
@@ -174,6 +186,9 @@ impl GpuModel<'_> {
             self.prefill_with(&tokens[from..keep], between)?;
             self.save_state()?;
             (self.saved_ids, self.saved_owner) = (tokens[..keep].to_vec(), own);
+            if let Err(e) = self.sync_saved_to_prompt_cache() {
+                eprintln!("warning: could not save prompt cache: {e:#}");
+            }
         }
         let logits = self.prefill_with(&tokens[keep..], between)?;
         if let Some(ng) = self.ngram.as_mut() { ng.begin(tokens); }

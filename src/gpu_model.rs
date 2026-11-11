@@ -187,6 +187,8 @@ pub struct GpuModel<'a> {
     sys_owner: u64,
     /// Host memory for `parked`, in bytes (0 = keep none).
     pub cache_ram: usize,
+    /// Optional disk path for persisting `parked` / `saved` conversation states across restarts (Warm Start).
+    pub prompt_cache_path: Option<std::path::PathBuf>,
     ctx: usize,
     pub pos: usize,
     pub cache: Option<ExpertCache>,
@@ -451,7 +453,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, ngram: None, first: range.start, next: None,
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, prompt_cache_path: None, cache, adapt_every: 8, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, ngram: None, first: range.start, next: None,
                       cur: 0, seqs, rows: vec![], row_tokens: 0 })
     }
 
@@ -735,20 +737,19 @@ impl<'a> GpuModel<'a> {
             }).collect()
     }
 
-    /// Copy the saved state to host memory, so a later request that continues it can take it back (`unpark`); the
-    /// least recently parked states go when they exceed `cache_ram`.
-    fn park(&mut self) -> anyhow::Result<()> {
+    /// Snapshot the current saved GPU state into a host-memory `Parked` record if it fits in `cache_ram`.
+    fn snapshot_saved(&self) -> anyhow::Result<Option<Parked>> {
         let n = self.saved_ids.len();
-        if n == 0 { return Ok(()) }
+        if n == 0 { return Ok(None) }
         let mut size = 0;
-        let mut p = Some(&*self);
+        let mut p = Some(self);
         while let Some(q) = p {
             size += q.kv_bufs().iter().map(|b| b.len() / q.ctx * n).sum::<usize>() + q.slot().iter().map(|b| b.len()).sum::<usize>();
             p = q.next.as_deref();
         }
-        if size > self.cache_ram { return Ok(()) }
+        if size > self.cache_ram { return Ok(None) }
         let mut parts = vec![];
-        let mut p = Some(&*self);
+        let mut p = Some(self);
         while let Some(q) = p {
             let g = &q.gpu;
             let slot = q.slot().iter().map(|b| g.get::<u8>(b, 0, b.len())).collect::<anyhow::Result<_>>()?;
@@ -756,8 +757,189 @@ impl<'a> GpuModel<'a> {
             parts.push(PartCopy { ple_prev: q.saved_ple_prev, slot, kv });
             p = q.next.as_deref();
         }
-        self.parked.insert(0, Parked { ids: self.saved_ids.clone(), owner: self.saved_owner, parts });
+        Ok(Some(Parked { ids: self.saved_ids.clone(), owner: self.saved_owner, parts }))
+    }
+
+    fn insert_parked(&mut self, pk: Parked) {
+        self.parked.retain(|old| !(old.owner == pk.owner && (pk.ids.starts_with(&old.ids) || old.ids == pk.ids)));
+        self.parked.insert(0, pk);
         while self.parked.iter().map(Parked::bytes).sum::<usize>() > self.cache_ram { self.parked.pop(); }
+    }
+
+    /// Copy the saved state to host memory, so a later request that continues it can take it back (`unpark`); the
+    /// least recently parked states go when they exceed `cache_ram`.
+    fn park(&mut self) -> anyhow::Result<()> {
+        if let Some(pk) = self.snapshot_saved()? {
+            self.insert_parked(pk);
+            if self.prompt_cache_path.is_some() {
+                if let Err(e) = self.save_prompt_cache() {
+                    eprintln!("warning: could not save prompt cache: {e:#}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Snapshot the current saved state into `parked` and persist to `prompt_cache_path` (Warm Start).
+    pub(crate) fn sync_saved_to_prompt_cache(&mut self) -> anyhow::Result<()> {
+        if self.prompt_cache_path.is_none() { return Ok(()) }
+        if let Some(pk) = self.snapshot_saved()? {
+            self.insert_parked(pk);
+            self.save_prompt_cache()?;
+        }
+        Ok(())
+    }
+
+    fn prompt_cache_fingerprint(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.m.cfg.n_layer.hash(&mut h);
+        self.m.cfg.n_embd.hash(&mut h);
+        self.m.cfg.n_vocab.hash(&mut h);
+        self.m.cfg.n_head.hash(&mut h);
+        self.m.cfg.n_head_kv.hash(&mut h);
+        self.m.cfg.head_dim.hash(&mut h);
+        self.m.cfg.ssm_d_inner.hash(&mut h);
+        self.m.cfg.ssm_d_state.hash(&mut h);
+        let mut p = Some(self);
+        while let Some(q) = p {
+            q.layers.len().hash(&mut h);
+            q.kv_bufs().len().hash(&mut h);
+            for b in q.kv_bufs() { (b.len() / q.ctx).hash(&mut h); }
+            p = q.next.as_deref();
+        }
+        h.finish()
+    }
+
+    /// Save up to 4 most recent `Parked` states to `self.prompt_cache_path` atomically.
+    pub fn save_prompt_cache(&self) -> anyhow::Result<()> {
+        use std::io::Write;
+        let Some(path) = &self.prompt_cache_path else { return Ok(()) };
+        if self.parked.is_empty() { return Ok(()) }
+        if let Some(parent) = path.parent() && !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("tmp");
+        let f = std::fs::File::create(&tmp)?;
+        let mut w = std::io::BufWriter::with_capacity(8 << 20, f);
+        w.write_all(b"STRATAPC")?;
+        w.write_all(&1u32.to_le_bytes())?;
+        w.write_all(&self.prompt_cache_fingerprint().to_le_bytes())?;
+        let entries: Vec<&Parked> = self.parked.iter().take(4).collect();
+        w.write_all(&(entries.len() as u32).to_le_bytes())?;
+        for pk in entries {
+            w.write_all(&pk.owner.to_le_bytes())?;
+            w.write_all(&(pk.ids.len() as u32).to_le_bytes())?;
+            for &id in &pk.ids {
+                w.write_all(&id.to_le_bytes())?;
+            }
+            w.write_all(&(pk.parts.len() as u32).to_le_bytes())?;
+            for part in &pk.parts {
+                w.write_all(&part.ple_prev[0].to_le_bytes())?;
+                w.write_all(&part.ple_prev[1].to_le_bytes())?;
+                w.write_all(&(part.slot.len() as u32).to_le_bytes())?;
+                for s in &part.slot {
+                    w.write_all(&(s.len() as u64).to_le_bytes())?;
+                    w.write_all(s)?;
+                }
+                w.write_all(&(part.kv.len() as u32).to_le_bytes())?;
+                for k in &part.kv {
+                    w.write_all(&(k.len() as u64).to_le_bytes())?;
+                    w.write_all(k)?;
+                }
+            }
+        }
+        w.flush()?;
+        drop(w);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Enable Warm Start persistence at `path` and load any existing compatible states into `self.parked`.
+    pub fn load_prompt_cache(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
+        use std::io::Read;
+        self.prompt_cache_path = Some(path.to_path_buf());
+        if !path.exists() {
+            return Ok(());
+        }
+        let f = std::fs::File::open(path)?;
+        let mut r = std::io::BufReader::with_capacity(8 << 20, f);
+        let mut magic = [0u8; 8];
+        r.read_exact(&mut magic)?;
+        ensure!(&magic == b"STRATAPC", "invalid magic in prompt cache {}", path.display());
+        let mut u4 = [0u8; 4];
+        let mut u8b = [0u8; 8];
+        r.read_exact(&mut u4)?;
+        let ver = u32::from_le_bytes(u4);
+        ensure!(ver == 1, "unsupported prompt cache version {ver}");
+        r.read_exact(&mut u8b)?;
+        let fp = u64::from_le_bytes(u8b);
+        let expected_fp = self.prompt_cache_fingerprint();
+        ensure!(fp == expected_fp, "prompt cache fingerprint mismatch (model or --kv changed)");
+        r.read_exact(&mut u4)?;
+        let n_entries = u32::from_le_bytes(u4) as usize;
+        let n_parts_expected = self.parts().count();
+        let mut loaded = Vec::new();
+        for _ in 0..n_entries {
+            r.read_exact(&mut u8b)?;
+            let owner = u64::from_le_bytes(u8b);
+            r.read_exact(&mut u4)?;
+            let n_ids = u32::from_le_bytes(u4) as usize;
+            if n_ids == 0 || n_ids > self.ctx {
+                bail!("cached sequence length {n_ids} exceeds --ctx {}", self.ctx);
+            }
+            let mut ids = Vec::with_capacity(n_ids);
+            for _ in 0..n_ids {
+                r.read_exact(&mut u4)?;
+                ids.push(u32::from_le_bytes(u4));
+            }
+            r.read_exact(&mut u4)?;
+            let n_parts = u32::from_le_bytes(u4) as usize;
+            ensure!(n_parts == n_parts_expected, "prompt cache part count {n_parts} != {n_parts_expected}");
+            let mut parts = Vec::with_capacity(n_parts);
+            for _ in 0..n_parts {
+                r.read_exact(&mut u8b)?;
+                let p0 = i64::from_le_bytes(u8b);
+                r.read_exact(&mut u8b)?;
+                let p1 = i64::from_le_bytes(u8b);
+                r.read_exact(&mut u4)?;
+                let n_slot = u32::from_le_bytes(u4) as usize;
+                let mut slot = Vec::with_capacity(n_slot);
+                for _ in 0..n_slot {
+                    r.read_exact(&mut u8b)?;
+                    let len = u64::from_le_bytes(u8b) as usize;
+                    let mut buf = vec![0u8; len];
+                    r.read_exact(&mut buf)?;
+                    slot.push(buf);
+                }
+                r.read_exact(&mut u4)?;
+                let n_kv = u32::from_le_bytes(u4) as usize;
+                let mut kv = Vec::with_capacity(n_kv);
+                for _ in 0..n_kv {
+                    r.read_exact(&mut u8b)?;
+                    let len = u64::from_le_bytes(u8b) as usize;
+                    let mut buf = vec![0u8; len];
+                    r.read_exact(&mut buf)?;
+                    kv.push(buf);
+                }
+                parts.push(PartCopy { ple_prev: [p0, p1], slot, kv });
+            }
+            loaded.push(Parked { ids, owner, parts });
+        }
+        let mut total_toks = 0usize;
+        let mut total_bytes = 0usize;
+        for pk in loaded.into_iter().rev() {
+            total_toks += pk.ids.len();
+            total_bytes += pk.bytes();
+            self.insert_parked(pk);
+        }
+        if !self.parked.is_empty() {
+            eprintln!(
+                "warm start: loaded {} cached prefix state(s) ({total_toks} tokens, {:.1} MB) from {}",
+                self.parked.len(),
+                total_bytes as f64 / 1048576.0,
+                path.display()
+            );
+        }
         Ok(())
     }
 
