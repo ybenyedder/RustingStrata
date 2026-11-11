@@ -103,8 +103,15 @@ fn mv(t: &Tensor, x: &[f32]) -> Vec<f32> {
 impl<'a> Model<'a> {
     pub fn load(g: &'a Gguf) -> anyhow::Result<Model<'a>> { Self::load_with_lora(g, &[]) }
     pub fn load_with_lora(g: &'a Gguf, loras: &[(String, f32)]) -> anyhow::Result<Model<'a>> {
+        Self::load_with_aux(g, None, loras)
+    }
+    pub fn load_with_aux(g: &'a Gguf, aux: Option<&'a Gguf>, loras: &[(String, f32)]) -> anyhow::Result<Model<'a>> {
         let mut cfg = ModelConfig::from_gguf(g)?;
-        let w = Weights::new(g)?;
+        let w = Weights::new_with_aux(g, aux)?;
+        if cfg.n_nextn == 0 && aux.is_some_and(|ag| ag.tensors.contains_key(&format!("blk.{}.nextn.eh_proj.weight", cfg.n_layer))) {
+            cfg.n_nextn = 1;
+            eprintln!("note: loaded standalone MTP draft head from companion GGUF (layer {})", cfg.n_layer);
+        }
         if !w.validate(cfg.n_layer)? && cfg.n_nextn > 0 {
             eprintln!("note: the MTP (nextn) layer has a quant type this engine does not support; loading without MTP");
             cfg.n_nextn = 0;
