@@ -120,10 +120,29 @@ impl Parked {
     fn bytes(&self) -> usize { self.parts.iter().flat_map(|p| p.slot.iter().chain(&p.kv)).map(Vec::len).sum() }
 }
 
+/// Standalone EAGLE3 1-layer GPU weights and scratch buffers.
+struct Eagle3Gpu {
+    cfg: crate::config::Eagle3Config,
+    fc: GpuTensor,
+    output: GpuTensor,
+    /// `[TMAX, 3 * n_embd]` concatenated hidden states extracted before `extract_layers`.
+    feat: Buf,
+    /// `[TMAX, n_embd]` output of `fc` for the last target forward.
+    cur_g: Buf,
+    q: Buf,
+    k: Buf,
+    v: Buf,
+    att: Buf,
+    attp: Buf,
+    ge: Buf,
+    ue: Buf,
+}
+
 struct MtpHead {
-    layer: Layer, eh_proj: GpuTensor, enorm: GpuTensor, hnorm: GpuTensor, head_norm: GpuTensor,
-    worker: CpuWorker, step_buf: Buf, emb: Buf, eh: Buf, x: Buf, pos: usize,
-    /// Row 0 of the main model's `x` at `save_state` (the hidden state the next entry pairs with).
+    layer: Layer, eh_proj: Option<GpuTensor>, enorm: GpuTensor, hnorm: GpuTensor, head_norm: GpuTensor,
+    worker: Option<CpuWorker>, step_buf: Buf, emb: Buf, eh: Buf, x: Buf, pos: usize,
+    eagle: Option<Eagle3Gpu>,
+    /// Row 0 of the main model's `x` (or `eagle.cur_g`) at `save_state`.
     saved_x: Buf,
     /// Accepted drafts of the last `spec_step` whose draft head entries (from the main model's hidden rows 0..) are
     /// still to be written; the next `spec_step` writes them in its first draft pass.
@@ -361,11 +380,81 @@ impl<'a> GpuModel<'a> {
             Ok(Layer { attn_norm, post_norm, hc, ple, mixer, ffn })
         };
         let layers = range.clone().map(|il| load_layer(il, c.layers[il])).collect::<anyhow::Result<Vec<_>>>()?;
-        let mtp_parts = if mtp {
+        let mtp_head = if mtp {
             let il = c.n_layer;
-            Some((load_layer(il, LayerKind::Attn)?, lt(il, "nextn.eh_proj.weight")?, lt(il, "nextn.enorm.weight")?,
-                  lt(il, "nextn.hnorm.weight")?, lt(il, "nextn.shared_head_norm.weight")?,
-                  gpu.zeros::<i32>(2 * TMAX)?, gpu.zeros::<f32>(TMAX * c.n_embd)?, gpu.zeros::<f32>(TMAX * 2 * c.n_embd)?, gpu.zeros::<f32>(TMAX * c.n_embd)?))
+            if let Some(ec) = c.eagle3.clone() {
+                let eg_kv = ec.n_head_kv * ec.head_dim;
+                let layer = Layer {
+                    attn_norm: None,
+                    post_norm: Some(lt(il, "post_attention_norm.weight")?),
+                    hc: None,
+                    ple: None,
+                    mixer: Mixer::Attn {
+                        q: lt(il, "attn_q.weight")?,
+                        k: lt(il, "attn_k.weight")?,
+                        v: lt(il, "attn_v.weight")?,
+                        qn: lt(il, "nextn.enorm.weight")?,
+                        kn: lt(il, "nextn.hnorm.weight")?,
+                        o: lt(il, "attn_output.weight")?,
+                        kc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words(ctx * eg_kv))).collect::<anyhow::Result<_>>()?,
+                        vc: (0..ns).map(|_| gpu.zeros::<u16>(gpu.kv_words(ctx * eg_kv))).collect::<anyhow::Result<_>>()?,
+                        qsa: None,
+                    },
+                    ffn: Ffn::Dense {
+                        gate: lt(il, "ffn_gate.weight")?,
+                        up: lt(il, "ffn_up.weight")?,
+                        down: lt(il, "ffn_down.weight")?,
+                    },
+                };
+                let attp_len = ec.n_head * ATT_SPLITS * (ec.head_dim + 2);
+                let eg = Eagle3Gpu {
+                    fc: lt(il, "eagle3.fc.weight")?,
+                    output: lt(il, "eagle3.output.weight")?,
+                    feat: gpu.zeros::<f32>(TMAX * 3 * c.n_embd)?,
+                    cur_g: gpu.zeros::<f32>(TMAX * c.n_embd)?,
+                    q: gpu.zeros::<f32>(TMAX * ec.n_head * ec.head_dim)?,
+                    k: gpu.zeros::<f32>(TMAX * eg_kv)?,
+                    v: gpu.zeros::<f32>(TMAX * eg_kv)?,
+                    att: gpu.zeros::<f32>(TMAX * ec.n_head * ec.head_dim)?,
+                    attp: gpu.zeros::<f32>(TMAX * attp_len)?,
+                    ge: gpu.zeros::<f32>(TMAX * ec.n_ff)?,
+                    ue: gpu.zeros::<f32>(TMAX * ec.n_ff)?,
+                    cfg: ec,
+                };
+                Some(MtpHead {
+                    layer,
+                    eh_proj: None,
+                    enorm: lt(il, "nextn.enorm.weight")?,
+                    hnorm: lt(il, "nextn.hnorm.weight")?,
+                    head_norm: lt(il, "nextn.shared_head_norm.weight")?,
+                    worker: None,
+                    step_buf: gpu.zeros::<i32>(2 * TMAX)?,
+                    emb: gpu.zeros::<f32>(TMAX * c.n_embd)?,
+                    eh: gpu.zeros::<f32>(TMAX * 2 * c.n_embd)?,
+                    x: gpu.zeros::<f32>(TMAX * c.n_embd)?,
+                    pos: 0,
+                    eagle: Some(eg),
+                    saved_x: gpu.zeros::<f32>(c.n_embd)?,
+                    pend: vec![],
+                })
+            } else {
+                Some(MtpHead {
+                    layer: load_layer(il, LayerKind::Attn)?,
+                    eh_proj: Some(lt(il, "nextn.eh_proj.weight")?),
+                    enorm: lt(il, "nextn.enorm.weight")?,
+                    hnorm: lt(il, "nextn.hnorm.weight")?,
+                    head_norm: lt(il, "nextn.shared_head_norm.weight")?,
+                    worker: Some(CpuWorker::new(m, &*gpu, vec![c.n_layer])?),
+                    step_buf: gpu.zeros::<i32>(2 * TMAX)?,
+                    emb: gpu.zeros::<f32>(TMAX * c.n_embd)?,
+                    eh: gpu.zeros::<f32>(TMAX * 2 * c.n_embd)?,
+                    x: gpu.zeros::<f32>(TMAX * c.n_embd)?,
+                    pos: 0,
+                    eagle: None,
+                    saved_x: gpu.zeros::<f32>(c.n_embd)?,
+                    pend: vec![],
+                })
+            }
         } else { None };
         let (output_norm, output_hc) = if !last { (None, None) } else if c.hc_n > 0 { (None, Some(hc_read("output_hc_")?)) } else { (Some(up("output_norm.weight")?), None) };
         let ple_ring = if c.n_embd_ple > 0 { Some((gpu.zeros::<f32>(16 * hcn * c.n_embd)?, gpu.zeros::<f32>(16 * hcn * c.n_embd)?)) } else { None };
@@ -428,7 +517,7 @@ impl<'a> GpuModel<'a> {
                 }
                 None => free1.saturating_sub(vram_margin),
             };
-            Some(ExpertCache::new(m, &*gpu, budget, range.start..range.end + mtp as usize)?)
+            Some(ExpertCache::new(m, &*gpu, budget, range.start..range.end + (mtp && c.eagle3.is_none()) as usize)?)
         } else { None };
         let worker = if c.is_moe() { Some(CpuWorker::new(m, &*gpu, range.clone().collect())?) } else { None };
         // R3a: prefetch the next layer's experts predicted by the previous token's routing there. Disabled on gfx11xx/iGPU
@@ -456,13 +545,7 @@ impl<'a> GpuModel<'a> {
                 mb(per), mb(ca.token_bytes(k)), ca.total_experts() / c.n_expert.max(1),
                 if prefetch { ", next-layer L2 prefetch on (STRATA_MOE_PREFETCH)" } else { "" });
         }
-        let mtp = match mtp_parts {
-            Some((layer, eh_proj, enorm, hnorm, head_norm, step_buf, emb, eh, x)) => Some(MtpHead {
-                layer, eh_proj, enorm, hnorm, head_norm, worker: CpuWorker::new(m, &*gpu, vec![c.n_layer])?,
-                step_buf, emb, eh, x, pos: 0, pend: vec![], saved_x: gpu.zeros::<f32>(c.n_embd)?,
-            }),
-            None => None,
-        };
+        let mtp = mtp_head;
         Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, prompt_cache_path: None, cache, adapt_every: 8, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, ngram: None, first: range.start, next: None,
                       cur: 0, seqs, rows: vec![], row_tokens: 0 })
     }
@@ -705,7 +788,10 @@ impl<'a> GpuModel<'a> {
                 g.dtod(s, 0, bs, 0, s.len())?;
             }
         }
-        if let Some(h) = &self.mtp { g.dtod(&self.x, 0, &h.saved_x, 0, 4 * self.m.cfg.n_embd)?; }
+        if let Some(h) = &self.mtp {
+            let src = h.eagle.as_ref().map_or(&self.x, |e| &e.cur_g);
+            g.dtod(src, 0, &h.saved_x, 0, 4 * self.m.cfg.n_embd)?;
+        }
         if let Some((r, sr)) = &self.ple_ring { g.dtod(r, 0, sr, 0, r.len())?; }
         if let Some(q) = &self.qsa { g.dtod(&q.ring, 0, &q.saved, 0, q.ring.len())?; }
         self.saved_ple_prev = self.ple_prev;
@@ -1049,7 +1135,8 @@ impl<'a> GpuModel<'a> {
         self.ple_prev = self.saved_ple_prev;
         // The draft head's entries before the saved position are still the ones its prompt fill wrote (see `mtp_synced`).
         if let Some(h) = self.mtp.as_mut() {
-            g.dtod(&h.saved_x, 0, &self.x, 0, 4 * self.m.cfg.n_embd)?;
+            let dst = h.eagle.as_ref().map_or(&self.x, |e| &e.cur_g);
+            g.dtod(&h.saved_x, 0, dst, 0, 4 * self.m.cfg.n_embd)?;
             h.pos = self.pos.saturating_sub(1);
             h.pend.clear();
         }
@@ -1064,7 +1151,7 @@ impl<'a> GpuModel<'a> {
     /// Run the forward of `nt` tokens as a recorded graph (graph key `nt` and the attention regime), recorded on first use.
     fn run(&self, nt: usize) -> anyhow::Result<()> {
         let gq = gq_min(self.pos, nt);
-        if self.m.loras.is_empty() {
+        if self.m.loras.is_empty() && self.mtp.as_ref().is_none_or(|h| h.eagle.is_none()) {
             self.gpu.graph(nt as u64 | (gq as u32 as u64) << 8 | (self.cur as u64) << 40, &mut || self.forward(nt, gq, None))
         } else { self.forward(nt, gq, None) }
     }
@@ -1081,6 +1168,16 @@ impl<'a> GpuModel<'a> {
         let mut res = 0;
         for (i, l) in self.layers.iter().enumerate().skip(from.map_or(0, |il| il - self.first)) {
             let il = self.first + i;
+            if from != Some(il) {
+                if let Some(eg) = self.mtp.as_ref().and_then(|h| h.eagle.as_ref()) {
+                    if let Some(idx) = eg.cfg.extract_layers.iter().position(|&el| el == il) {
+                        if res != 0 { g.add(x, res, nt * ne)?; res = 0; }
+                        for r in 0..nt {
+                            g.dtod(&self.x, 4 * r * ne, &eg.feat, 4 * (r * 3 + idx) * ne, 4 * ne)?;
+                        }
+                    }
+                }
+            }
             res = self.layer(il, l, x, step, self.worker.as_ref(), nt, res, gq, from == Some(il))?;
         }
         if self.next.is_some() { return if res != 0 { g.add(x, res, nt * ne) } else { Ok(()) }; }
@@ -1088,6 +1185,9 @@ impl<'a> GpuModel<'a> {
             (Some(on), _) => g.rms_norm_q(x, ne, on.ptr, p("h"), ne, ne, nt, eps, p("hq"), res)?,
             (None, Some(hr)) => self.hc_read(hr, x, nt, &self.hc_at())?,
             _ => unreachable!(),
+        }
+        if let Some(eg) = self.mtp.as_ref().and_then(|h| h.eagle.as_ref()) {
+            self.mv(&eg.fc, eg.feat.addr(), 3 * ne, eg.cur_g.addr(), ne, nt)?;
         }
         g.gemvq(self.output.as_ref().unwrap(), p("h"), ne, p("hq"), self.logits.addr(), c.n_vocab, nt)
     }
@@ -1249,7 +1349,10 @@ impl<'a> GpuModel<'a> {
     }
 
     /// Address of hidden row `row` of the last `step` or `verify`.
-    fn row_ptr(&self, row: usize) -> u64 { self.x.addr() + 4 * (row * self.m.cfg.n_embd) as u64 }
+    fn row_ptr(&self, row: usize) -> u64 {
+        let base = self.mtp.as_ref().and_then(|h| h.eagle.as_ref()).map_or_else(|| self.x.addr(), |e| e.cur_g.addr());
+        base + 4 * (row * self.m.cfg.n_embd) as u64
+    }
 
     /// Draft head on `tokens` with hidden states at `hid` (rows of n_embd), as one batch at the next draft positions;
     /// returns the argmax of the last token's logits (left in `logits` row 0), or 0 when `head` = false skips the head.
@@ -1258,8 +1361,8 @@ impl<'a> GpuModel<'a> {
         let c = &self.m.cfg;
         let Some(h) = self.mtp.as_mut() else { bail!("MTP head not loaded") };
         if h.pos + nt > self.ctx { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
-        let fast = self.cache.as_ref().is_some_and(|c| c.fully_resident()) && self.gpu.moe_mailbox_optional();
-        let seq = if fast { 0 } else { h.worker.begin() };
+        let fast = h.eagle.is_some() || (self.cache.as_ref().is_some_and(|c| c.fully_resident()) && self.gpu.moe_mailbox_optional());
+        let seq = if fast { 0 } else { h.worker.as_mut().unwrap().begin() };
         let g = &self.gpu;
         let emb: Vec<f32> = tokens.iter().flat_map(|&t| self.m.embed(t)).collect();
         g.put(&emb, &h.emb, 0)?;
@@ -1267,19 +1370,23 @@ impl<'a> GpuModel<'a> {
         g.put(&steps, &h.step_buf, 0)?;
         // `run` keys are token counts (below 8); the top bit keeps these keys apart from them.
         let gq = gq_min(h.pos, nt);
-        let key = { let mut s = std::hash::DefaultHasher::new(); (hid, nt, head, gq).hash(&mut s); s.finish() | 1 << 63 };
+        let key = { let mut s = std::hash::DefaultHasher::new(); (hid, nt, head, gq, self.cur).hash(&mut s); s.finish() | 1 << 63 };
         if self.m.loras.is_empty() { g.graph(key, &mut || self.mtp_forward(hid, nt, head, gq, false))?; } else { self.mtp_forward(hid, nt, head, gq, false)?; }
         let mut d = if head { g.get::<i32>(&self.amax, 0, 1)?[0] as u32 } else { g.sync()?; 0 };
         if self.finish(nt, gq, Some((hid, head)))? && head { d = self.gpu.get::<i32>(&self.amax, 0, 1)?[0] as u32; }
         let h = self.mtp.as_mut().unwrap();
         h.pos += nt;
+        if let Some(eg) = &h.eagle {
+            if head { d = eg.cfg.d2t.get(d as usize).copied().unwrap_or(d as i32) as u32; }
+            return Ok(d);
+        }
         // Fast path: every expert of the draft layer is resident, so nothing can miss and there is nothing to record
         // (R2). The routing counters keep the head's share of the hit rate.
         if fast {
             self.hits += c.n_expert_used * nt;
         } else if let Some(cache) = self.cache.as_mut() {
             // One mailbox read per layer, as in `after_experts` (each is a bulk copy of the routing words).
-            let r = h.worker.routing(c.n_layer);
+            let r = h.worker.as_mut().unwrap().routing(c.n_layer);
             self.mailbox_reads.set(self.mailbox_reads.get() + 1);
             let (hits, misses) = tally(&r);
             self.hits += hits;
@@ -1298,7 +1405,7 @@ impl<'a> GpuModel<'a> {
         let mut again = false;
         let mut last = None;
         while self.gpu.stalled() {
-            let w = match mtp { Some(_) => &self.mtp.as_ref().unwrap().worker, None => self.worker.as_ref().unwrap() };
+            let w = match mtp { Some(_) => self.mtp.as_ref().unwrap().worker.as_ref().unwrap(), None => self.worker.as_ref().unwrap() };
             let il = w.stalled_layer().context("a MoE combine gave up waiting, but no layer says so")?;
             // The worker had answered the last time: the GPU does not see the mailbox.
             ensure!(last != Some(il), "moe_combine: the GPU does not see the CPU expert worker's answers. On an AMD RX 9000 \
@@ -1319,14 +1426,58 @@ impl<'a> GpuModel<'a> {
     /// Enqueue the draft head (see `mtp_run`).
     fn mtp_forward(&self, hid: u64, nt: usize, head: bool, gq: i32, resume: bool) -> anyhow::Result<()> {
         let (c, g, h) = (&self.m.cfg, &self.gpu, self.mtp.as_ref().unwrap());
+        if let Some(eg) = &h.eagle {
+            let ec = &eg.cfg;
+            let (eps, ne, hp) = (ec.eps, c.n_embd, self.bufs["h"].addr());
+            let (eh, x) = (h.eh.addr(), h.x.addr());
+            let (nh, nkv, hd) = (ec.n_head, ec.n_head_kv, ec.head_dim);
+            let kv = nkv * hd;
+            g.rms_norm(h.emb.addr(), ne, h.enorm.ptr, eh, 2 * ne, ne, nt, eps)?;
+            g.rms_norm(hid, ne, h.hnorm.ptr, eh + 4 * ne as u64, 2 * ne, ne, nt, eps)?;
+            if ec.norm_before_residual {
+                g.rms_norm(hid, ne, h.hnorm.ptr, x, ne, ne, nt, eps)?;
+            } else if hid != x {
+                g.memset(&h.x)?;
+                g.add(x, hid, nt * ne)?;
+            }
+            let Mixer::Attn { q, k, v, o, kc, vc, .. } = &h.layer.mixer else { unreachable!() };
+            let Ffn::Dense { gate, up, down } = &h.layer.ffn else { unreachable!() };
+            g.batch(&mut || {
+                self.mv(q, eh, 2 * ne, eg.q.addr(), nh * hd, nt)?;
+                self.mv(k, eh, 2 * ne, eg.k.addr(), kv, nt)?;
+                self.mv(v, eh, 2 * ne, eg.v.addr(), kv, nt)
+            })?;
+            g.batch(&mut || {
+                g.rope_neox(eg.q.addr(), hd, nt * nh, nh, ec.n_rot, h.step_buf.addr(), ec.rope_base)?;
+                g.rope_neox(eg.k.addr(), hd, nt * nkv, nkv, ec.n_rot, h.step_buf.addr(), ec.rope_base)
+            })?;
+            g.kv_store(eg.k.addr(), eg.v.addr(), kc[self.cur].addr(), vc[self.cur].addr(), kv, nt, h.step_buf.addr(), hd)?;
+            g.attn_decode_q(eg.q.addr(), kc[self.cur].addr(), vc[self.cur].addr(), 0, eg.att.addr(),
+                eg.attp.addr(), h.step_buf.addr(), nh, nkv, hd, 1.0 / (hd as f32).sqrt(), gq, nt, 0, 0, 0)?;
+            self.mv(o, eg.att.addr(), nh * hd, self.bufs["mix"].addr(), ne, nt)?;
+            g.rms_norm_q(x, ne, h.layer.post_norm.as_ref().unwrap().ptr, hp, ne, ne, nt, eps, 0, self.bufs["mix"].addr())?;
+            g.batch(&mut || {
+                self.mv(gate, hp, ne, eg.ge.addr(), ec.n_ff, nt)?;
+                self.mv(up, hp, ne, eg.ue.addr(), ec.n_ff, nt)
+            })?;
+            g.swiglu(eg.ge.addr(), eg.ue.addr(), nt * ec.n_ff)?;
+            self.mv(down, eg.ge.addr(), ec.n_ff, self.bufs["ye"].addr(), ne, nt)?;
+            g.add(x, self.bufs["ye"].addr(), nt * ne)?;
+            if head {
+                g.rms_norm(x + 4 * ((nt - 1) * ne) as u64, 0, h.head_norm.ptr, hp, 0, ne, 1, eps)?;
+                g.gemv(&eg.output, hp, self.logits.addr())?;
+                g.argmax_rows(self.logits.addr(), ec.draft_vocab, 1, self.amax.addr())?;
+            }
+            return Ok(());
+        }
         let (eps, ne, hp) = (c.eps, c.n_embd, self.bufs["h"].addr());
         let (eh, x) = (h.eh.addr(), h.x.addr());
         if !resume {
             g.rms_norm(h.emb.addr(), ne, h.enorm.ptr, eh, 2 * ne, ne, nt, eps)?;
             g.rms_norm(hid, ne, h.hnorm.ptr, eh + 4 * ne as u64, 2 * ne, ne, nt, eps)?;
-            self.mv(&h.eh_proj, eh, 2 * ne, x, ne, nt)?;
+            self.mv(h.eh_proj.as_ref().unwrap(), eh, 2 * ne, x, ne, nt)?;
         }
-        let res = self.layer(c.n_layer, &h.layer, x, h.step_buf.addr(), Some(&h.worker), nt, 0, gq, resume)?;
+        let res = self.layer(c.n_layer, &h.layer, x, h.step_buf.addr(), h.worker.as_ref(), nt, 0, gq, resume)?;
         if res != 0 { g.add(x, res, nt * ne)?; }
         if head {
             g.rms_norm(x + 4 * ((nt - 1) * ne) as u64, 0, h.head_norm.ptr, hp, 0, ne, 1, eps)?;
