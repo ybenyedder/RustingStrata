@@ -148,4 +148,11 @@ impl Gguf {
         let o = data_offset + t.offset as usize;
         &mmap[o..o + n]
     }
+
+    /// Raw bytes for auxiliary metadata tensors whose GGML type is not in `GgmlType` (e.g. EAGLE3 `d2t` I32/I64).
+    pub fn raw_bytes(&self, t: &TensorInfo, byte_len: usize) -> anyhow::Result<&[u8]> {
+        let (mmap, data_offset) = &self.files[t.file];
+        let o = data_offset + t.offset as usize;
+        mmap.get(o..o + byte_len).context("GGUF tensor bytes out of range")
+    }
 }

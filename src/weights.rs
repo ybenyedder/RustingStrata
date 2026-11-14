@@ -88,6 +88,30 @@ impl<'a> Weights<'a> {
             w.built.insert(format!("blk.{il}.ssm_beta.weight"), Tensor { data: leak(b), ..half });
             w.built.insert(format!("blk.{il}.ssm_alpha.weight"), Tensor { data: leak(a), ..half });
         }
+        // Standalone EAGLE3 draft GGUF: remap layer-0 draft weights onto blk.{n_layer}.* so they never shadow layer 0.
+        if let Some(ag) = aux_g.filter(|ag| ag.tensors.contains_key("fc.weight")) {
+            let nl = c.n_layer;
+            for (name, t) in &ag.tensors {
+                if matches!(name.as_str(), "d2t" | "t2d" | "token_embd.weight") { continue; }
+                let Ok(ty) = GgmlType::from_u32(t.ty) else { continue };
+                let dst = match name.as_str() {
+                    "fc.weight" => format!("blk.{nl}.eagle3.fc.weight"),
+                    "output.weight" => format!("blk.{nl}.eagle3.output.weight"),
+                    "output_norm.weight" => format!("blk.{nl}.nextn.shared_head_norm.weight"),
+                    "blk.0.attn_norm.weight" => format!("blk.{nl}.nextn.enorm.weight"),
+                    "blk.0.attn_norm_2.weight" => format!("blk.{nl}.nextn.hnorm.weight"),
+                    "blk.0.ffn_norm.weight" => format!("blk.{nl}.post_attention_norm.weight"),
+                    _ if name.starts_with("blk.0.") => format!("blk.{nl}.{}", &name["blk.0.".len()..]),
+                    _ => continue,
+                };
+                w.built.insert(dst, Tensor {
+                    ty,
+                    cols: t.dims[0] as usize,
+                    rows: t.dims[1..].iter().product::<u64>() as usize,
+                    data: ag.bytes(t),
+                });
+            }
+        }
         Ok(w)
     }
 
@@ -165,6 +189,7 @@ impl<'a> Weights<'a> {
         let mut nextn = true;
         let iter = self.g.tensors.values().chain(self.aux_g.into_iter().flat_map(|ag| ag.tensors.values()));
         for t in iter {
+            if matches!(t.name.as_str(), "d2t" | "t2d") { continue; }
             if let Err(e) = GgmlType::from_u32(t.ty) {
                 let il = t.name.strip_prefix("blk.").and_then(|r| r.split('.').next()).and_then(|i| i.parse::<usize>().ok());
                 if il.is_some_and(|il| il >= n_layer) { nextn = false; continue; }

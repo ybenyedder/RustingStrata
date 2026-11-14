@@ -764,7 +764,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let (prompt, cont) = (ids("prompt")?, ids("continuation")?);
             anyhow::ensure!(!prompt.is_empty() && !cont.is_empty(), "empty prompt or continuation");
             let g = Gguf::open(&model)?;
-            let aux_g = engine.mtp_model.as_ref().map(|p| Gguf::open(p)).transpose()?;
+            let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             if let Some(&t) = prompt.iter().chain(&cont).find(|&&t| t as usize >= m.cfg.n_vocab) {
                 anyhow::bail!("token id {t} out of range (vocabulary has {} tokens)", m.cfg.n_vocab);
@@ -798,7 +798,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 return rusting_strata::deepseek::chat::generate(&g, &prompt, n);
             }
-            let aux_g = engine.mtp_model.as_ref().map(|p| Gguf::open(p)).transpose()?;
+            let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let prompt = if prompt == "-" {
@@ -828,7 +828,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Perplexity { model, file, ctx_len: n, chunks, kld_base, mut engine } => {
             let g = Gguf::open(&model)?;
-            let aux_g = engine.mtp_model.as_ref().map(|p| Gguf::open(p)).transpose()?;
+            let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             // ponytail: no BOS at chunk starts (llama-perplexity adds one where the vocabulary asks for it; Qwen does not)
@@ -864,7 +864,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Bench { model, pp, tg, reps, json_out, mut engine } => {
             let g = Gguf::open(&model)?;
-            let aux_g = engine.mtp_model.as_ref().map(|p| Gguf::open(p)).transpose()?;
+            let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
@@ -953,7 +953,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
                 return rusting_strata::deepseek::chat::chat(&g, system, n, think);
             }
-            let aux_g = engine.mtp_model.as_ref().map(|p| Gguf::open(p)).transpose()?;
+            let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let mut r = engine.runner(&m, &model)?;
@@ -1593,6 +1593,26 @@ impl Serving {
     }
 }
 
+/// Resolve `--mtp-model` (`.gguf` file, directory containing `model.gguf`, or HF `.safetensors`/`.bin` with a
+/// converted sibling `model.gguf`) and open it as a companion GGUF.
+fn open_mtp_gguf(path: Option<&Path>) -> anyhow::Result<Option<Gguf>> {
+    let Some(p) = path else { return Ok(None) };
+    let gguf = if p.is_dir() {
+        p.join("model.gguf")
+    } else if matches!(p.extension().and_then(|e| e.to_str()), Some("safetensors" | "bin")) {
+        let sib = p.with_file_name("model.gguf");
+        if sib.exists() { sib } else { p.to_path_buf() }
+    } else {
+        p.to_path_buf()
+    };
+    anyhow::ensure!(
+        gguf.exists(),
+        "{}: not found (for HuggingFace EAGLE3 checkpoints, convert first via tools/convert_eagle3_to_gguf.py)",
+        gguf.display()
+    );
+    Ok(Some(Gguf::open(&gguf)?))
+}
+
 /// Loads `model`, answers `w` (the /api/load request that asked for it) and serves until another model is asked
 /// for. The model and its GPU memory are freed on return.
 fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<TcpStream>) -> anyhow::Result<Option<(PathBuf, TcpStream)>> {
@@ -1607,7 +1627,8 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
     let g = Gguf::open(model)?;
     let arch = g.get("general.architecture")?.as_str().context("general.architecture")?;
     s.stats.lock().unwrap().ctx_train = g.meta.get(&format!("{arch}.context_length")).and_then(|v| v.as_u64());
-    let mut m = Model::load(&g)?;
+    let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
+    let mut m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
     if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
     let tok = Tokenizer::from_gguf(&g)?;
     let r = engine.runner(&m, model)?;
