@@ -302,7 +302,8 @@ impl Engine {
             anyhow::ensure!(dp.exists(), "draft model path does not exist: {}", dp.display());
             eprintln!("draft model socket: registered candidate {}", dp.display());
         }
-        let ngram_cfg = self.ngram_config()?;
+        let mut ngram_cfg = self.ngram_config()?;
+        ngram_cfg.n_vocab = m.cfg.n_vocab;
         if ngram_cfg.is_enabled() && (self.mtp.unwrap_or(0) > 0 || self.mtp_model.is_some()) {
             anyhow::bail!("--spec-type {} and --mtp/--mtp-model are mutually exclusive (combo causes severe regression; disable --mtp/--mtp-model or set --spec-type none)", self.spec_type);
         }
@@ -368,6 +369,7 @@ impl Engine {
             mod_n_min: 2,
             lookup_cache_static: self.lookup_cache_static.clone(),
             lookup_cache_dynamic: self.lookup_cache_dynamic.clone(),
+            n_vocab: 0,
         })
     }
     fn sampler(&self) -> Sampler {
@@ -763,7 +765,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             anyhow::ensure!(!prompt.is_empty() && !cont.is_empty(), "empty prompt or continuation");
             let g = Gguf::open(&model)?;
             let aux_g = engine.mtp_model.as_ref().map(|p| Gguf::open(p)).transpose()?;
-            let mut m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
+            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             if let Some(&t) = prompt.iter().chain(&cont).find(|&&t| t as usize >= m.cfg.n_vocab) {
                 anyhow::bail!("token id {t} out of range (vocabulary has {} tokens)", m.cfg.n_vocab);
             }
@@ -797,7 +799,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 return rusting_strata::deepseek::chat::generate(&g, &prompt, n);
             }
             let aux_g = engine.mtp_model.as_ref().map(|p| Gguf::open(p)).transpose()?;
-            let mut m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
+            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let prompt = if prompt == "-" {
                 let mut s = String::new();
@@ -827,7 +829,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Perplexity { model, file, ctx_len: n, chunks, kld_base, mut engine } => {
             let g = Gguf::open(&model)?;
             let aux_g = engine.mtp_model.as_ref().map(|p| Gguf::open(p)).transpose()?;
-            let mut m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
+            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             // ponytail: no BOS at chunk starts (llama-perplexity adds one where the vocabulary asks for it; Qwen does not)
             let ids = tok.encode(&std::fs::read_to_string(&file)?)?;
@@ -863,7 +865,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Bench { model, pp, tg, reps, json_out, mut engine } => {
             let g = Gguf::open(&model)?;
             let aux_g = engine.mtp_model.as_ref().map(|p| Gguf::open(p)).transpose()?;
-            let mut m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
+            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
             let mut r = engine.runner(&m, &model)?;
@@ -952,7 +954,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 return rusting_strata::deepseek::chat::chat(&g, system, n, think);
             }
             let aux_g = engine.mtp_model.as_ref().map(|p| Gguf::open(p)).transpose()?;
-            let mut m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
+            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let mut r = engine.runner(&m, &model)?;
             let mut smp = engine.sampler();
