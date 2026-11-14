@@ -141,6 +141,10 @@ struct Inner {
     tsem: vk::Semaphore,
     mem: vk::PhysicalDeviceMemoryProperties,
     budget: bool,
+    /// Integrated GPU (APU sharing unified system LPDDR memory between device and host heaps).
+    igpu: bool,
+    /// AMD RDNA3 / RDNA3.5 (gfx11xx) or iGPU whose small L2 cache hurts from next-layer MoE prefetch.
+    gfx11: bool,
     /// The device runs fixed 64-lane subgroups, split into logical 32-lane warps.
     wave64: bool,
     /// VK_KHR_cooperative_matrix with the 16 x 16 x 16 f16 / f32 shape is enabled (`gemm_f`, `attn_prefill`).
@@ -377,7 +381,13 @@ impl Vk {
             && std::env::var_os("STRATA_VK_NO_COOP").is_none();  // STRATA_VK_NO_COOP: run the kernels for devices without them
         let coop_i8 = coop && shape(32, vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32);
         // The tiled fallback needs a 1024-thread workgroup and 32 KB of shared memory (see attn_prefill_tile.comp).
-        let limits = unsafe { instance.get_physical_device_properties(pd) }.limits;
+        let dev_props = unsafe { instance.get_physical_device_properties(pd) };
+        let limits = dev_props.limits;
+        let igpu = dev_props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+        let name_up = name.to_ascii_uppercase();
+        let gfx11 = dev_props.vendor_id == 0x1002 && (igpu || (coop && !coop_i8)
+            || ["GFX11", "STRIX", "PHOENIX", "KRACKAN", "NAVI3", "RADEON 8", "RADEON 7", "RX 7"]
+                .iter().any(|k| name_up.contains(k)));
         let dp_tile = !coop && limits.max_compute_work_group_invocations >= 1024 && limits.max_compute_shared_memory_size >= 32 << 10
             && std::env::var_os("STRATA_VK_DP_OLD").is_none();
         if coop { exts.push(ash::khr::cooperative_matrix::NAME.as_ptr()) }
@@ -451,7 +461,7 @@ impl Vk {
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
         let ts_period = limits.timestamp_period;
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, wave64, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, gfx11, wave64, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -520,13 +530,31 @@ impl Inner {
         let req = unsafe { self.dev.get_buffer_memory_requirements(buf) };
         // Memory the GPU does not cache (AMD flags 0xc0) only when asked for: it would be slow for anything else.
         let ok = |f: vk::MemoryPropertyFlags, want| f.contains(want) && (f & vk::MemoryPropertyFlags::from_raw(0xc0) & !want).is_empty();
-        let ty = wants.iter().find_map(|&want| (0..self.mem.memory_type_count).find(|&i| req.memory_type_bits & (1 << i) != 0
-            && ok(self.mem.memory_types[i as usize].property_flags, want)));
+        // On an iGPU, device-local and GTT heaps live in the same LPDDR: fall back to HOST if DEVICE heap is full.
+        let candidates: Vec<vk::MemoryPropertyFlags> = if wants == DEVICE && self.igpu {
+            wants.iter().chain(HOST.iter()).copied().collect()
+        } else {
+            wants.to_vec()
+        };
         let mut flags = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-        let r = ty.context("no memory type").and_then(|ty| Ok(unsafe { self.dev.allocate_memory(&vk::MemoryAllocateInfo::default()
-            .allocation_size(req.size).memory_type_index(ty).push_next(&mut flags), None) }
-            .with_context(|| format!("allocate {bytes} bytes"))?));
-        let mem = match r { Ok(m) => m, Err(e) => { unsafe { self.dev.destroy_buffer(buf, None) }; return Err(e) } };
+        let mut last_err = anyhow::anyhow!("no matching memory type for {bytes} bytes");
+        let mut mem_ok = None;
+        'outer: for want in candidates {
+            for i in 0..self.mem.memory_type_count {
+                if req.memory_type_bits & (1 << i) != 0 && ok(self.mem.memory_types[i as usize].property_flags, want) {
+                    match unsafe {
+                        self.dev.allocate_memory(
+                            &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(i).push_next(&mut flags),
+                            None,
+                        )
+                    } {
+                        Ok(m) => { mem_ok = Some(m); break 'outer; }
+                        Err(e) => last_err = anyhow::Error::from(e).context(format!("allocate {bytes} bytes")),
+                    }
+                }
+            }
+        }
+        let mem = match mem_ok { Some(m) => m, None => { unsafe { self.dev.destroy_buffer(buf, None) }; return Err(last_err); } };
         unsafe { self.dev.bind_buffer_memory(buf, mem, 0) }?;
         Ok((buf, mem))
     }
@@ -1315,7 +1343,7 @@ impl Backend for Vk {
         ensure!(n <= 512 && k <= 32, "moe_route: {n} experts, top {k}");
         self.run("moe_route", &[], [1, 1, 1], &[&p, &table, &ids, &wts, &slots, &wh, &h, &mb, &step, &pid, &(n as u32), &(k as u32), &extra_scale, &(nh as u32), &(h_off as u32), &(t as u32)])
     }
-    fn moe_prefetch_supported(&self) -> bool { true }
+    fn moe_prefetch_supported(&self) -> bool { !self.0.gfx11 && !self.0.igpu }
     fn moe_prefetch(&self, ids: u64, k: usize, table: u64, base: u64, stride: usize, bytes: usize) -> anyhow::Result<()> {
         let lines = bytes.div_ceil(128);
         self.run("moe_route", &[], [lines.div_ceil(256), k, 1], &[&base, &table, &ids, &0u64, &0u64, &0u64, &0u64, &0u64, &0u64, &0u64, &0u32, &(k as u32), &0f32, &(stride as u32), &(bytes as u32), &0u32])

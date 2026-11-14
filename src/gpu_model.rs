@@ -416,18 +416,28 @@ impl<'a> GpuModel<'a> {
             margin: lower --ctx or --parallel, use --kv q8 or a smaller --chunk (--vram-margin 0 skips this check)", free1 >> 20, floor >> 20);
 
         let cache = if c.is_moe() {
-            // STRATA_EXPERT_MB caps the expert slots, so that runs place the same experts whatever VRAM is free (a
-            // backend comparison, or other programs holding VRAM).
-            let cap = std::env::var("STRATA_EXPERT_MB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(usize::MAX, |v| v << 20);
-            let budget = free1.saturating_sub(vram_margin).min(cap);
+            // STRATA_EXPERT_MB sets the expert slot budget explicitly when > 0; otherwise use free VRAM minus margin.
+            let budget = match std::env::var("STRATA_EXPERT_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&v| v > 0)
+            {
+                Some(mb) => {
+                    eprintln!("note: STRATA_EXPERT_MB={mb} override active (reported free device heap: {} MB)", free1 >> 20);
+                    mb << 20
+                }
+                None => free1.saturating_sub(vram_margin),
+            };
             Some(ExpertCache::new(m, &*gpu, budget, range.start..range.end + mtp as usize)?)
         } else { None };
         let worker = if c.is_moe() { Some(CpuWorker::new(m, &*gpu, range.clone().collect())?) } else { None };
-        // R3a: prefetch the next layer's experts predicted by the previous token's routing there. Default off; the GPU
-        // window of issue #34 measures it and accepts or rejects it. CUDA has the kernel, Vulkan's `moe_prefetch` is a
-        // no-op.
-        let prefetch = c.is_moe() && gpu.moe_prefetch_supported()
-            && std::env::var("STRATA_MOE_PREFETCH").is_ok_and(|v| v != "0");
+        // R3a: prefetch the next layer's experts predicted by the previous token's routing there. Disabled on gfx11xx/iGPU
+        // where the small L2 cache causes prefetching to evict active lines and hurt decode throughput.
+        let want_prefetch = std::env::var("STRATA_MOE_PREFETCH").is_ok_and(|v| v != "0");
+        if c.is_moe() && want_prefetch && !gpu.moe_prefetch_supported() {
+            eprintln!("note: STRATA_MOE_PREFETCH ignored on {} (gfx11xx/iGPU L2 cache too small for MoE expert prefetch)", gpu.device());
+        }
+        let prefetch = c.is_moe() && gpu.moe_prefetch_supported() && want_prefetch;
         let pids = if prefetch { Some(gpu.zeros::<i32>((c.n_layer + 1) * c.n_expert_used)?) } else { None };
         let mb = |b: usize| b as f64 / 1048576.0;
         eprintln!(
