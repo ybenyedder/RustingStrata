@@ -79,6 +79,8 @@ pub struct NgramConfig {
     pub mod_n_min: usize,
     pub lookup_cache_static: Option<PathBuf>,
     pub lookup_cache_dynamic: Option<PathBuf>,
+    /// Target model vocabulary size (0 = unchecked). Tokens >= `n_vocab` are filtered from caches and drafts.
+    pub n_vocab: usize,
 }
 
 impl Default for NgramConfig {
@@ -93,6 +95,7 @@ impl Default for NgramConfig {
             mod_n_min: 4,
             lookup_cache_static: None,
             lookup_cache_dynamic: None,
+            n_vocab: 0,
         }
     }
 }
@@ -606,7 +609,7 @@ pub type NgramCacheMap = HashMap<NgramKey, NgramCachePart>;
 
 pub fn ngram_cache_update(cache: &mut NgramCacheMap, ngram_min: usize, ngram_max: usize, inp: &[u32], nnew: usize) {
     let inp_size = inp.len();
-    if inp_size == 0 || nnew == 0 {
+    if inp_size < 2 || nnew == 0 {
         return;
     }
     let nmin = ngram_min.clamp(1, LLAMA_NGRAM_MAX);
@@ -716,12 +719,17 @@ pub fn ngram_cache_draft(
 
     while draft.len() - 1 < n_draft {
         let total_len = inp_size + draft.len() - 1;
-        let ngram_start_static = total_len - LLAMA_NGRAM_STATIC;
-        let mut ngram_static = NgramKey::default();
-        for j in 0..LLAMA_NGRAM_STATIC {
-            ngram_static.0[j] = get_seq_token(&full_inp, &draft, ngram_start_static + j) as i32;
-        }
-        let part_static = nc_static.get(&ngram_static);
+        let ngram_static = if total_len >= LLAMA_NGRAM_STATIC {
+            let ngram_start_static = total_len - LLAMA_NGRAM_STATIC;
+            let mut k = NgramKey::default();
+            for j in 0..LLAMA_NGRAM_STATIC {
+                k.0[j] = get_seq_token(&full_inp, &draft, ngram_start_static + j) as i32;
+            }
+            Some(k)
+        } else {
+            None
+        };
+        let part_static = ngram_static.as_ref().and_then(|k| nc_static.get(k));
 
         let mut ngrams_cd = Vec::with_capacity(nmax - nmin + 1);
         for ngram_size_cd in nmin..=nmax {
@@ -752,7 +760,7 @@ pub fn ngram_cache_draft(
                 &DRAFT_MIN_PERCENT_STRICT,
             )
         })
-        .or_else(|| try_draft_static(nc_static, ngram_static));
+        .or_else(|| ngram_static.and_then(|k| try_draft_static(nc_static, k)));
 
         match drafted {
             Some(tok) => draft.push(tok),
@@ -842,6 +850,26 @@ pub fn ngram_cache_load(path: &Path, tok: Option<&crate::tokenizer::Tokenizer>) 
     ngram_cache_load_binary(&bytes)
 }
 
+/// Drop cache entries whose key or candidate tokens exceed `n_vocab` (e.g. a cache saved by a larger-vocab model).
+pub fn ngram_cache_filter_vocab(cache: &mut NgramCacheMap, n_vocab: usize) -> usize {
+    if n_vocab == 0 {
+        return 0;
+    }
+    let mut pruned = 0usize;
+    cache.retain(|key, part| {
+        let key_ok = key.0.iter().all(|&t| t == LLAMA_TOKEN_NULL || (t >= 0 && (t as usize) < n_vocab));
+        if !key_ok {
+            pruned += part.len().max(1);
+            return false;
+        }
+        let before = part.len();
+        part.retain(|&tok, _| (tok as usize) < n_vocab);
+        pruned += before - part.len();
+        !part.is_empty()
+    });
+    pruned
+}
+
 // ---------------------------------------------------------------------------
 // Unified Drafter (`NgramDrafter`) owned by `GpuModel`
 // ---------------------------------------------------------------------------
@@ -865,14 +893,22 @@ pub struct NgramDrafter {
 impl NgramDrafter {
     pub fn new(cfg: NgramConfig, tok: Option<&crate::tokenizer::Tokenizer>) -> anyhow::Result<Self> {
         let eos = tok.map(|t| t.eos_ids()).unwrap_or_default();
-        let nc_static = match &cfg.lookup_cache_static {
+        let mut nc_static = match &cfg.lookup_cache_static {
             Some(p) => ngram_cache_load(p, tok)?,
             None => NgramCacheMap::new(),
         };
-        let nc_dynamic = match &cfg.lookup_cache_dynamic {
+        let mut nc_dynamic = match &cfg.lookup_cache_dynamic {
             Some(p) if p.exists() => ngram_cache_load(p, tok).unwrap_or_default(),
             _ => NgramCacheMap::new(),
         };
+        let pruned = ngram_cache_filter_vocab(&mut nc_static, cfg.n_vocab)
+            + ngram_cache_filter_vocab(&mut nc_dynamic, cfg.n_vocab);
+        if pruned > 0 {
+            eprintln!(
+                "note: pruned {pruned} out-of-vocabulary entries (n_vocab={}) from ngram lookup cache",
+                cfg.n_vocab
+            );
+        }
         let map_k = cfg
             .types
             .contains(&SpecType::NgramMapK)
@@ -1030,6 +1066,11 @@ impl NgramDrafter {
         if let Some(pos) = out.iter().position(|t| self.eos.contains(t)) {
             out.truncate(pos + 1);
         }
+        if self.cfg.n_vocab > 0 {
+            if let Some(pos) = out.iter().position(|&t| (t as usize) >= self.cfg.n_vocab) {
+                out.truncate(pos);
+            }
+        }
         self.last_draft_len = out.len();
         out
     }
@@ -1133,5 +1174,40 @@ mod tests {
         assert_eq!(cache.len(), loaded.len());
         let draft = ngram_cache_draft(&[10, 20], 30, 4, 1, 4, &loaded, &NgramCacheMap::new(), &NgramCacheMap::new());
         assert_eq!(draft, vec![40, 50, 10, 20]);
+    }
+
+    #[test]
+    fn test_ngram_cache_draft_short_history() {
+        let empty = NgramCacheMap::new();
+        let draft = ngram_cache_draft(&[], 42, 4, 1, 4, &empty, &empty, &empty);
+        assert!(draft.is_empty());
+        let mut c = NgramCacheMap::new();
+        ngram_cache_update(&mut c, 1, 4, &[], 1);
+        ngram_cache_update(&mut c, 1, 4, &[42], 1);
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn test_ngram_cache_vocab_filter() {
+        let mut cache = NgramCacheMap::new();
+        // Token ID 231622 comes from a 248320-vocab model; target is 151936-vocab Qwen3-30B-A3B.
+        let cross_seq = vec![10u32, 20, 231_622, 10, 20, 231_622, 10, 20, 231_622];
+        ngram_cache_update(&mut cache, 1, 4, &cross_seq, cross_seq.len());
+        let valid_seq = vec![10u32, 20, 30, 10, 20, 30, 10, 20, 30];
+        ngram_cache_update(&mut cache, 1, 4, &valid_seq, valid_seq.len());
+        let tmp = std::env::temp_dir().join("strata_test_ngram_vocab_filter.bin");
+        ngram_cache_save(&cache, &tmp).unwrap();
+        let cfg = NgramConfig {
+            types: vec![SpecType::NgramCache],
+            n_vocab: 151_936,
+            lookup_cache_static: Some(tmp.clone()),
+            ..Default::default()
+        };
+        let mut drafter = NgramDrafter::new(cfg, None).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        drafter.begin(&[10]);
+        let drafted = drafter.draft(20, 8);
+        assert!(drafted.iter().all(|&t| (t as usize) < 151_936));
+        assert_eq!(drafted.first().copied(), Some(30));
     }
 }

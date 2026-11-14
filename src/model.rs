@@ -186,7 +186,8 @@ impl<'a> Model<'a> {
 
     pub fn embed(&self, token: u32) -> Vec<f32> {
         let mut x = vec![0f32; self.cfg.n_embd];
-        self.w.get("token_embd.weight").unwrap().row(token as usize, &mut x);
+        let idx = (token as usize).min(self.cfg.n_vocab.saturating_sub(1));
+        self.w.get("token_embd.weight").unwrap().row(idx, &mut x);
         x
     }
 

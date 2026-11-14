@@ -972,9 +972,19 @@ impl<'a> GpuModel<'a> {
         self.restore_state()
     }
 
+    fn has_delta(&self) -> bool {
+        self.parts().any(|p| p.layers.iter().any(|l| matches!(l.mixer, Mixer::Delta { .. })))
+    }
+
     /// Keep only the first `keep` tokens of the last `verify`, which started at position `start` (1 <= keep <= `k`):
     /// recurrent states come from the snapshots it wrote, KV entries past them are dropped by rewinding `pos`.
     pub fn rollback(&mut self, start: usize, keep: usize) -> anyhow::Result<()> {
+        if !self.has_delta() {
+            ensure!((1..=TMAX).contains(&keep) && start + keep <= self.pos, "rollback: keep {keep} of verify at {start}");
+            self.pos = start + keep;
+            if let Some(n) = self.next.as_mut() { n.rollback(start, keep)?; }
+            return Ok(());
+        }
         let nsnap = self.k.min(SNAP_MAX);
         if !(1..=nsnap).contains(&keep) || start + keep > self.pos { bail!("rollback: keep {keep} of verify at {start}"); }
         let g = &self.gpu;
@@ -993,9 +1003,11 @@ impl<'a> GpuModel<'a> {
     }
 
     /// Keep the first `keep` tokens (`1 <= keep < toks.len()`) of a `verify` that started at `start`.
-    /// When `keep <= SNAP_MAX`, restores the recurrent snapshot directly (`dtod`); when `keep > SNAP_MAX`,
-    /// restores snapshot `SNAP_MAX` and replays `&toks[SNAP_MAX..keep]` in one forward pass.
+    /// Pure-attention models only rewind `pos`; DeltaNet models restore up to `SNAP_MAX` snapshots and replay any remainder.
     pub fn rollback_tokens(&mut self, start: usize, keep: usize, toks: &[u32]) -> anyhow::Result<()> {
+        if !self.has_delta() {
+            return self.rollback(start, keep);
+        }
         let nsnap = self.k.min(SNAP_MAX);
         if keep <= nsnap {
             return self.rollback(start, keep);
