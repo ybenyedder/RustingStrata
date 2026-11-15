@@ -789,4 +789,116 @@ mod tests {
         assert_eq!((ec.n_head, ec.head_dim, ec.n_head_kv, ec.n_ff, ec.draft_vocab), (2, 4, 1, 6, 3));
         assert_eq!(ec.d2t, vec![0, 1, 7]);
     }
+
+    #[test]
+    fn eagle3_safetensors_auto_converts_and_loads() {
+        let dir = std::env::temp_dir().join(format!("strata-e3-st-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Build tiny target GGUF (`qwen3moe` 1 layer, embd=4, n_vocab=8, nh=2, nkv=1, hd=2)
+        let (mut hdr, mut body, mut off) = (Vec::new(), Vec::new(), 0u64);
+        let push_tensor = |h: &mut Vec<u8>, b: &mut Vec<u8>, o: &mut u64, name: &str, dims: &[u64], ty: u32, data: &[u8]| {
+            w_str(h, name);
+            h.extend((dims.len() as u32).to_le_bytes());
+            for &d in dims { h.extend(d.to_le_bytes()); }
+            h.extend(ty.to_le_bytes());
+            h.extend((*o).to_le_bytes());
+            b.extend_from_slice(data);
+            let pad = (32 - data.len() % 32) % 32;
+            b.extend(std::iter::repeat_n(0u8, pad));
+            *o += (data.len() + pad) as u64;
+        };
+        let mut kvs = Vec::new();
+        let add_u32 = |b: &mut Vec<u8>, k: &str, v: u32| { w_str(b, k); b.extend(4u32.to_le_bytes()); b.extend(v.to_le_bytes()); };
+        let add_f32 = |b: &mut Vec<u8>, k: &str, v: f32| { w_str(b, k); b.extend(6u32.to_le_bytes()); b.extend(v.to_le_bytes()); };
+        let add_str = |b: &mut Vec<u8>, k: &str, v: &str| { w_str(b, k); b.extend(8u32.to_le_bytes()); w_str(b, v); };
+        add_str(&mut kvs, "general.architecture", "qwen3moe");
+        add_u32(&mut kvs, "qwen3moe.block_count", 1);
+        add_u32(&mut kvs, "qwen3moe.embedding_length", 4);
+        add_u32(&mut kvs, "qwen3moe.attention.head_count", 2);
+        add_u32(&mut kvs, "qwen3moe.attention.head_count_kv", 1);
+        add_f32(&mut kvs, "qwen3moe.attention.layer_norm_rms_epsilon", 1e-6);
+        let z4 = vec![0u8; 4 * 4];
+        let z4x8 = vec![0u8; 32 * 4];
+        push_tensor(&mut hdr, &mut body, &mut off, "token_embd.weight", &[4, 8], 0, &z4x8);
+        push_tensor(&mut hdr, &mut body, &mut off, "output_norm.weight", &[4], 0, &z4);
+        push_tensor(&mut hdr, &mut body, &mut off, "blk.0.attn_norm.weight", &[4], 0, &z4);
+        let mut tgt = Vec::new();
+        tgt.extend(b"GGUF");
+        tgt.extend(3u32.to_le_bytes());
+        tgt.extend(3u64.to_le_bytes());
+        tgt.extend(6u64.to_le_bytes());
+        tgt.extend(kvs);
+        tgt.extend(hdr);
+        while tgt.len() % 32 != 0 { tgt.push(0); }
+        tgt.extend(body);
+        let pt = dir.join("target.gguf");
+        std::fs::write(&pt, &tgt).unwrap();
+
+        // Build synthetic HuggingFace EAGLE3 `config.json` + `model.safetensors`
+        let cfg_path = dir.join("config.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{
+                "hidden_size": 4,
+                "intermediate_size": 6,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 1000000.0,
+                "norm_before_residual": false,
+                "draft_vocab_size": 3,
+                "eagle_aux_hidden_state_layer_ids": [0, 0, 0]
+            }"#,
+        ).unwrap();
+
+        let d2t_bytes: Vec<u8> = [0i64, 0, 5].into_iter().flat_map(|v| v.to_le_bytes()).collect();
+        let st_specs: Vec<(&str, &str, Vec<u64>, Vec<u8>)> = vec![
+            ("fc.weight", "BF16", vec![4, 12], vec![0u8; 4 * 12 * 2]),
+            ("midlayer.input_layernorm.weight", "BF16", vec![4], vec![0u8; 4 * 2]),
+            ("midlayer.hidden_norm.weight", "F32", vec![4], vec![0u8; 4 * 4]),
+            ("midlayer.self_attn.q_proj.weight", "BF16", vec![8, 8], vec![0u8; 8 * 8 * 2]),
+            ("midlayer.self_attn.k_proj.weight", "BF16", vec![4, 8], vec![0u8; 4 * 8 * 2]),
+            ("midlayer.self_attn.v_proj.weight", "BF16", vec![4, 8], vec![0u8; 4 * 8 * 2]),
+            ("midlayer.self_attn.o_proj.weight", "BF16", vec![4, 8], vec![0u8; 4 * 8 * 2]),
+            ("midlayer.post_attention_layernorm.weight", "F32", vec![4], vec![0u8; 4 * 4]),
+            ("midlayer.mlp.gate_proj.weight", "BF16", vec![6, 4], vec![0u8; 6 * 4 * 2]),
+            ("midlayer.mlp.up_proj.weight", "BF16", vec![6, 4], vec![0u8; 6 * 4 * 2]),
+            ("midlayer.mlp.down_proj.weight", "BF16", vec![4, 6], vec![0u8; 4 * 6 * 2]),
+            ("norm.weight", "F32", vec![4], vec![0u8; 4 * 4]),
+            ("lm_head.weight", "BF16", vec![3, 4], vec![0u8; 3 * 4 * 2]),
+            ("d2t", "I64", vec![3], d2t_bytes),
+        ];
+        let mut st_hdr = serde_json::Map::new();
+        let mut st_body = Vec::new();
+        for (name, dt, shape, data) in st_specs {
+            let start = st_body.len();
+            st_body.extend_from_slice(&data);
+            let end = st_body.len();
+            st_hdr.insert(
+                name.to_string(),
+                serde_json::json!({"dtype": dt, "shape": shape, "data_offsets": [start, end]}),
+            );
+        }
+        let hdr_bytes = serde_json::to_vec(&st_hdr).unwrap();
+        let mut st_file = Vec::with_capacity(8 + hdr_bytes.len() + st_body.len());
+        st_file.extend_from_slice(&(hdr_bytes.len() as u64).to_le_bytes());
+        st_file.extend_from_slice(&hdr_bytes);
+        st_file.extend_from_slice(&st_body);
+        let st_path = dir.join("model.safetensors");
+        std::fs::write(&st_path, &st_file).unwrap();
+
+        let aux_gguf = dir.join("model.gguf");
+        crate::gguf::convert_safetensors_eagle3_to_gguf(&st_path, &cfg_path, &aux_gguf, 48).unwrap();
+
+        let gt = Gguf::open(&pt).unwrap();
+        let ga = Gguf::open(&aux_gguf).unwrap();
+        let m = Model::load_with_aux(&gt, Some(&ga), &[]).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let ec = m.cfg.eagle3.as_ref().expect("eagle3 config loaded from converted safetensors");
+        assert_eq!(m.cfg.n_nextn, 1);
+        assert_eq!((ec.n_head, ec.head_dim, ec.n_head_kv, ec.n_ff, ec.draft_vocab), (2, 4, 1, 6, 3));
+        assert_eq!(ec.d2t, vec![0, 1, 7]);
+    }
 }
