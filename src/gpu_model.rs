@@ -1379,7 +1379,8 @@ impl<'a> GpuModel<'a> {
             };
             return Ok((vec![t], next, 0));
         }
-        let k_eff = if partial_moe && k > 1 && hits12 < 11 { 1 } else { k };
+        let is_eagle = h.eagle.is_some();
+        let k_eff = if partial_moe && k > 1 && hits12 < if is_eagle { 7 } else { 11 } { 1 } else { k };
         let mut toks = vec![t];
         let mut hid = self.row_ptr(row + 1 - nf);
         for i in 0..k_eff {
@@ -1406,8 +1407,8 @@ impl<'a> GpuModel<'a> {
         h.pos = hp + 1;
         h.pend = toks[1..=n].to_vec();
         h.adapt_window = ((h.adapt_window << 1) | u16::from(n > 0)) & 0x0FFF;
-        if partial_moe && n == 0 && (hits12 <= 8 || hits6 <= 3) {
-            h.adapt_skip = 3;
+        if partial_moe && n == 0 && (if is_eagle { hits12 <= 3 && hits6 <= 1 } else { hits12 <= 8 || hits6 <= 3 }) {
+            h.adapt_skip = if is_eagle { 2 } else { 3 };
         }
         toks.truncate(n + 1);
         Ok((toks, next, n))
