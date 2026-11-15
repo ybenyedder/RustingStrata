@@ -202,17 +202,19 @@ pub fn convert_safetensors_eagle3_to_gguf(
 
     let cfg_str = std::fs::read_to_string(cfg_path).with_context(|| format!("read {}", cfg_path.display()))?;
     let cfg: serde_json::Value = serde_json::from_str(&cfg_str).with_context(|| format!("parse {}", cfg_path.display()))?;
+    let layer_cfg = cfg.get("transformer_layer_config").unwrap_or(&cfg);
 
     let req_u64 = |k: &str| -> anyhow::Result<u64> {
-        cfg.get(k).and_then(|v| v.as_u64()).with_context(|| format!("{}: missing integer key {k}", cfg_path.display()))
+        layer_cfg.get(k).or_else(|| cfg.get(k)).and_then(|v| v.as_u64())
+            .with_context(|| format!("{}: missing integer key {k}", cfg_path.display()))
     };
     let n_embd = req_u64("hidden_size")? as u32;
     let n_ff = req_u64("intermediate_size")? as u32;
     let n_head = req_u64("num_attention_heads")? as u32;
     let n_head_kv = req_u64("num_key_value_heads")? as u32;
-    let head_dim = cfg.get("head_dim").and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or_else(|| n_embd / n_head.max(1));
-    let eps = cfg.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6) as f32;
-    let rope_theta = cfg.get("rope_theta").and_then(|v| v.as_f64()).unwrap_or(1_000_000.0) as f32;
+    let head_dim = layer_cfg.get("head_dim").or_else(|| cfg.get("head_dim")).and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or_else(|| n_embd / n_head.max(1));
+    let eps = layer_cfg.get("rms_norm_eps").or_else(|| cfg.get("rms_norm_eps")).and_then(|v| v.as_f64()).unwrap_or(1e-6) as f32;
+    let rope_theta = layer_cfg.get("rope_theta").or_else(|| cfg.get("rope_theta")).and_then(|v| v.as_f64()).unwrap_or(1_000_000.0) as f32;
     let norm_before_residual = cfg.get("norm_before_residual").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let st_file = std::fs::File::open(st_path).with_context(|| format!("open {}", st_path.display()))?;
@@ -258,7 +260,9 @@ pub fn convert_safetensors_eagle3_to_gguf(
 
     let mut prepared: Vec<(String, Vec<u64>, u32, Cow<'_, [u8]>)> = Vec::with_capacity(TENSOR_MAP.len() + 1);
     for &(hf_name, gguf_name, dst_ty) in &TENSOR_MAP {
-        let st = tensors.get(hf_name).with_context(|| format!("{}: missing EAGLE3 tensor {hf_name}", st_path.display()))?;
+        let st = tensors.get(hf_name)
+            .or_else(|| hf_name.strip_prefix("midlayer.").and_then(|rest| tensors.get(&format!("layers.0.{rest}"))))
+            .with_context(|| format!("{}: missing EAGLE3 tensor {hf_name}", st_path.display()))?;
         let gguf_dims: Vec<u64> = st.shape.iter().copied().rev().collect();
         let bytes: Cow<'_, [u8]> = match (dst_ty, st.dtype.as_str()) {
             (GGML_TYPE_BF16, "BF16") | (GGML_TYPE_F32, "F32") => Cow::Borrowed(st.raw),
