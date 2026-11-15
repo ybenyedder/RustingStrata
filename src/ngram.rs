@@ -661,10 +661,17 @@ fn try_draft_primary(
     min_sample_size: &[i32; LLAMA_NGRAM_MAX],
     min_percent: &[i32; LLAMA_NGRAM_MAX],
 ) -> Option<u32> {
-    for (i, &ngram) in ngrams_primary.iter().enumerate().rev() {
+    for &ngram in ngrams_primary.iter().rev() {
         let Some(part_primary) = nc_primary.get(&ngram) else {
             continue;
         };
+        let idx = ngram
+            .0
+            .iter()
+            .take_while(|&&t| t != LLAMA_TOKEN_NULL)
+            .count()
+            .saturating_sub(1)
+            .min(LLAMA_NGRAM_MAX - 1);
         let mut max_count_primary = 0i64;
         let mut max_count_static = 0i64;
         let mut sum_count_primary = 0i32;
@@ -682,10 +689,10 @@ fn try_draft_primary(
             }
             sum_count_primary += count_primary;
         }
-        if sum_count_primary < min_sample_size[i] {
+        if sum_count_primary < min_sample_size[idx] {
             continue;
         }
-        if 100 * (max_count_primary as i32) < min_percent[i] * sum_count_primary {
+        if 100 * (max_count_primary as i32) < min_percent[idx] * sum_count_primary {
             continue;
         }
         if max_token.is_some() {
@@ -1026,16 +1033,32 @@ impl NgramDrafter {
                         ngram_cache_update(&mut self.nc_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, &inp, nnew);
                         self.cache_size = inp.len();
                     }
-                    ngram_cache_draft(
-                        &self.history,
-                        sampled,
-                        cap,
-                        2,
-                        LLAMA_NGRAM_MAX,
-                        &self.nc_context,
-                        &self.nc_dynamic,
-                        &self.nc_static,
-                    )
+                    let exact = if self.short_cooldown == 0 {
+                        ngram_simple_draft_eos(&self.history, sampled, 6, self.cfg.size_m, cap, &self.eos)
+                    } else {
+                        Vec::new()
+                    };
+                    if !exact.is_empty() {
+                        exact
+                    } else if self.short_cooldown == 0 || !self.nc_static.is_empty() || !self.nc_dynamic.is_empty() {
+                        let cache_cap = if self.nc_static.is_empty() && self.nc_dynamic.is_empty() {
+                            cap.min(6)
+                        } else {
+                            cap
+                        };
+                        ngram_cache_draft(
+                            &self.history,
+                            sampled,
+                            cache_cap,
+                            2,
+                            LLAMA_NGRAM_MAX,
+                            &self.nc_context,
+                            &self.nc_dynamic,
+                            &self.nc_static,
+                        )
+                    } else {
+                        Vec::new()
+                    }
                 }
             };
             if !res.is_empty() {
@@ -1209,5 +1232,16 @@ mod tests {
         let drafted = drafter.draft(20, 8);
         assert!(drafted.iter().all(|&t| (t as usize) < 151_936));
         assert_eq!(drafted.first().copied(), Some(30));
+    }
+
+    #[test]
+    fn test_ngram_cache_try_draft_primary_indexes_by_ngram_len() {
+        let mut cache = NgramCacheMap::new();
+        // Single occurrence of [10, 20, 30] -> 40. With nmin=2, a 3-token context key must consult
+        // DRAFT_MIN_SAMPLE_SIZE_LAX[2] (= 1), not index [1] (= 2).
+        let seq = vec![10u32, 20, 30, 40];
+        ngram_cache_update(&mut cache, 2, 4, &seq, seq.len());
+        let draft = ngram_cache_draft(&[10, 20], 30, 2, 2, 4, &cache, &NgramCacheMap::new(), &NgramCacheMap::new());
+        assert_eq!(draft, vec![40]);
     }
 }
