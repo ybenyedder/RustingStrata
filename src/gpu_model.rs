@@ -147,6 +147,10 @@ struct MtpHead {
     /// Accepted drafts of the last `spec_step` whose draft head entries (from the main model's hidden rows 0..) are
     /// still to be written; the next `spec_step` writes them in its first draft pass.
     pend: Vec<u32>,
+    /// 12-step rolling window of draft acceptance bits (LSB = latest step), used for adaptive speculative depth.
+    adapt_window: u16,
+    /// Remaining 1-token bypass steps before probing EAGLE3/MTP again on partially-resident MoE runs.
+    adapt_skip: u8,
 }
 
 /// What a slot keeps while another slot is current (`use_slot`): the `GpuModel` fields of the same names.
@@ -436,6 +440,8 @@ impl<'a> GpuModel<'a> {
                     eagle: Some(eg),
                     saved_x: gpu.zeros::<f32>(c.n_embd)?,
                     pend: vec![],
+                    adapt_window: 0x0FFF,
+                    adapt_skip: 0,
                 })
             } else {
                 Some(MtpHead {
@@ -453,6 +459,8 @@ impl<'a> GpuModel<'a> {
                     eagle: None,
                     saved_x: gpu.zeros::<f32>(c.n_embd)?,
                     pend: vec![],
+                    adapt_window: 0x0FFF,
+                    adapt_skip: 0,
                 })
             }
         } else { None };
@@ -554,7 +562,7 @@ impl<'a> GpuModel<'a> {
     pub fn reset(&mut self) -> anyhow::Result<()> {
         self.saved_ids.clear();
         self.sys = None;
-        if let Some(h) = self.mtp.as_mut() { h.pos = 0; h.pend.clear(); }
+        if let Some(h) = self.mtp.as_mut() { h.pos = 0; h.pend.clear(); h.adapt_window = 0x0FFF; h.adapt_skip = 0; }
         if let Some(ng) = self.ngram.as_mut() { ng.reset(); }
         for l in self.layers.iter().chain(self.mtp.as_ref().map(|h| &h.layer)) {
             match &l.mixer {
@@ -1139,6 +1147,8 @@ impl<'a> GpuModel<'a> {
             g.dtod(&h.saved_x, 0, dst, 0, 4 * self.m.cfg.n_embd)?;
             h.pos = self.pos.saturating_sub(1);
             h.pend.clear();
+            h.adapt_window = 0x0FFF;
+            h.adapt_skip = 0;
         }
         if let Some(n) = self.next.as_mut() { n.restore_state()?; }
         Ok(())
@@ -1151,7 +1161,7 @@ impl<'a> GpuModel<'a> {
     /// Run the forward of `nt` tokens as a recorded graph (graph key `nt` and the attention regime), recorded on first use.
     fn run(&self, nt: usize) -> anyhow::Result<()> {
         let gq = gq_min(self.pos, nt);
-        if self.m.loras.is_empty() && self.mtp.as_ref().is_none_or(|h| h.eagle.is_none()) {
+        if self.m.loras.is_empty() {
             self.gpu.graph(nt as u64 | (gq as u32 as u64) << 8 | (self.cur as u64) << 40, &mut || self.forward(nt, gq, None))
         } else { self.forward(nt, gq, None) }
     }
@@ -1267,37 +1277,58 @@ impl<'a> GpuModel<'a> {
     pub fn spec_step(&mut self, t: u32, row: usize, smp: &mut Sampler) -> anyhow::Result<(Vec<u32>, u32, usize)> {
         let k = self.k;
         if self.pos + k + 1 > self.ctx { return Ok((vec![t], smp.pick(&self.step(t)?)? as u32, 0)); }
+        let partial_moe = self.cache.as_ref().is_some_and(|c| !c.fully_resident())
+            && std::env::var_os("STRATA_MTP_ADAPT").is_none_or(|v| v != "0");
         let h = self.mtp.as_mut().unwrap();
         let mut first = std::mem::take(&mut h.pend);
         if first.len() != row { first.clear(); }
         first.push(t);
         let nf = first.len();
         let hp = h.pos + nf - 1;
+        let hits12 = (h.adapt_window & 0x0FFF).count_ones();
+        let hits6 = (h.adapt_window & 0x3F).count_ones();
+        if partial_moe && h.adapt_skip > 0 {
+            h.adapt_skip -= 1;
+            let hid = self.row_ptr(row + 1 - nf);
+            self.mtp_run(&first, hid, false)?;
+            self.mtp.as_mut().unwrap().pos = hp + 1;
+            let next = if smp.temp <= 0.0 {
+                self.step_greedy(t)?
+            } else {
+                smp.pick(&self.step(t)?)? as u32
+            };
+            return Ok((vec![t], next, 0));
+        }
+        let k_eff = if partial_moe && k > 1 && hits12 < 11 { 1 } else { k };
         let mut toks = vec![t];
         let mut hid = self.row_ptr(row + 1 - nf);
-        for i in 0..k {
+        for i in 0..k_eff {
             let d = if i == 0 { self.mtp_run(&first, hid, true)? } else { self.mtp_run(&toks[i..=i], hid, true)? };
             hid = self.mtp.as_ref().unwrap().x.addr() + 4 * ((if i == 0 { nf } else { 1 } - 1) * self.m.cfg.n_embd) as u64;
             toks.push(d);
         }
         let start = self.pos;
         let (n, next) = if smp.temp <= 0.0 {
-            self.verify_greedy(&toks, |am| (0..k).take_while(|&i| am[i] == toks[i + 1]).count())?
+            self.verify_greedy(&toks, |am| (0..k_eff).take_while(|&i| am[i] == toks[i + 1]).count())?
         } else {
             let l = self.verify(&toks)?;
             let mut n = 0;
             loop {
-                if n == k { break (n, smp.pick(&l[n])? as u32); }
+                if n == k_eff { break (n, smp.pick(&l[n])? as u32); }
                 match smp.accept(&l[n], toks[n + 1] as usize)? { None => n += 1, Some(x) => break (n, x as u32) }
             }
         };
-        self.drafts.0 += k;
+        self.drafts.0 += k_eff;
         self.drafts.1 += n;
-        if n < k { self.rollback(start, n + 1)?; }
+        if n < k_eff { self.rollback(start, n + 1)?; }
         // Draft head entries past t were made from draft hidden states: the next call redoes them from main rows.
         let h = self.mtp.as_mut().unwrap();
         h.pos = hp + 1;
         h.pend = toks[1..=n].to_vec();
+        h.adapt_window = ((h.adapt_window << 1) | u16::from(n > 0)) & 0x0FFF;
+        if partial_moe && n == 0 && (hits12 <= 8 || hits6 <= 3) {
+            h.adapt_skip = 3;
+        }
         toks.truncate(n + 1);
         Ok((toks, next, n))
     }
@@ -1352,6 +1383,10 @@ impl<'a> GpuModel<'a> {
         let h = self.mtp.as_mut().unwrap();
         h.pos = hp + 1;
         h.pend = toks[1..=n].to_vec();
+        if n > 0 {
+            h.adapt_window = ((h.adapt_window << 1) | 1) & 0x0FFF;
+            h.adapt_skip = 0;
+        }
         toks.truncate(n + 1);
         if let Some(ng) = self.ngram.as_mut() { ng.accept(&toks); }
         Ok((toks, next, n))
@@ -1428,7 +1463,8 @@ impl<'a> GpuModel<'a> {
         let gq = gq_min(h.pos, nt);
         let key = { let mut s = std::hash::DefaultHasher::new(); (hid, nt, head, gq, self.cur).hash(&mut s); s.finish() | 1 << 63 };
         if self.m.loras.is_empty() { g.graph(key, &mut || self.mtp_forward(hid, nt, head, gq, false))?; } else { self.mtp_forward(hid, nt, head, gq, false)?; }
-        let mut d = if head { g.get::<i32>(&self.amax, 0, 1)?[0] as u32 } else { g.sync()?; 0 };
+        let is_eagle = self.mtp.as_ref().is_some_and(|h| h.eagle.is_some());
+        let mut d = if head { g.get::<i32>(&self.amax, 0, 1)?[0] as u32 } else { if !is_eagle { g.sync()?; } 0 };
         if self.finish(nt, gq, Some((hid, head)))? && head { d = self.gpu.get::<i32>(&self.amax, 0, 1)?[0] as u32; }
         let h = self.mtp.as_mut().unwrap();
         h.pos += nt;
