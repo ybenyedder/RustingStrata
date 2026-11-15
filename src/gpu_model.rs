@@ -240,7 +240,7 @@ pub struct GpuModel<'a> {
     /// Prefill scratch (None: prompts go through `step`).
     pf: Option<prefill::Scratch>,
     mtp: Option<MtpHead>,
-    /// Speculative N-gram / lookup cache drafter (mutually exclusive with `mtp`).
+    /// Speculative N-gram / lookup cache drafter (standalone or combined with `mtp` via `hybrid_spec_step`).
     pub ngram: Option<crate::ngram::NgramDrafter>,
     /// The layers of this part are `first..first + layers.len()`.
     first: usize,
@@ -1302,12 +1302,68 @@ impl<'a> GpuModel<'a> {
         Ok((toks, next, n))
     }
 
+    /// Hybrid speculative decode combining context N-gram / lookup bursts (`NgramDrafter`) with MTP / EAGLE3 drafting:
+    /// uses zero-cost N-gram chains when matched, falls back to `spec_step` (EAGLE3/MTP) on a miss, keeps `MtpHead`
+    /// synchronized across N-gram steps, and feeds verified tokens back into `NgramDrafter`.
+    pub fn hybrid_spec_step(&mut self, t: u32, row: usize, smp: &mut Sampler) -> anyhow::Result<(Vec<u32>, u32, usize)> {
+        let max_draft = if self.has_delta() {
+            self.k.min(SNAP_MAX)
+        } else {
+            self.ngram.as_ref().map_or(self.k, |ng| ng.cfg.draft_max).min(TMAX - 1)
+        };
+        let room = self.ctx.saturating_sub(self.pos + 1).min(max_draft);
+        let draft = match self.ngram.as_mut() {
+            Some(ng) if room > 0 => ng.draft(t, room),
+            _ => Vec::new(),
+        };
+        if draft.is_empty() {
+            let (toks, next, rw) = self.spec_step(t, row, smp)?;
+            if let Some(ng) = self.ngram.as_mut() { ng.accept(&toks); }
+            return Ok((toks, next, rw));
+        }
+        // Advance the draft head over [pend.., t] using previous main hidden states before `verify` overwrites them.
+        let h = self.mtp.as_mut().unwrap();
+        let mut first = std::mem::take(&mut h.pend);
+        if first.len() != row { first.clear(); }
+        first.push(t);
+        let nf = first.len();
+        let hp = h.pos + nf - 1;
+        let hid = self.row_ptr(row + 1 - nf);
+        self.mtp_run(&first, hid, false)?;
+
+        let m = draft.len();
+        let mut toks = Vec::with_capacity(1 + m);
+        toks.push(t);
+        toks.extend_from_slice(&draft);
+        let start = self.pos;
+        let (n, next) = if smp.temp <= 0.0 {
+            self.verify_greedy(&toks, |am| (0..m).take_while(|&i| am[i] == toks[i + 1]).count())?
+        } else {
+            let l = self.verify(&toks)?;
+            let mut n = 0;
+            loop {
+                if n == m { break (n, smp.pick(&l[n])? as u32); }
+                match smp.accept(&l[n], toks[n + 1] as usize)? { None => n += 1, Some(x) => break (n, x as u32) }
+            }
+        };
+        self.drafts.0 += m;
+        self.drafts.1 += n;
+        if n < m { self.rollback(start, n + 1)?; }
+        let h = self.mtp.as_mut().unwrap();
+        h.pos = hp + 1;
+        h.pend = toks[1..=n].to_vec();
+        toks.truncate(n + 1);
+        if let Some(ng) = self.ngram.as_mut() { ng.accept(&toks); }
+        Ok((toks, next, n))
+    }
+
     /// Speculative decode with context N-gram / lookup cache drafting (`NgramDrafter`).
     /// When no N-gram match is found (`draft.is_empty()`), executes a normal 1-token decode step (`step_greedy` or `step`)
     /// with zero GPU overhead. When `m > 0` draft tokens are proposed, verifies `[t, draft..]` in a single pass and
     /// rolls back any rejected suffix via `rollback_tokens`.
     pub fn ngram_spec_step(&mut self, t: u32, smp: &mut Sampler) -> anyhow::Result<(Vec<u32>, u32)> {
-        let room = self.ctx.saturating_sub(self.pos + 1).min(self.k);
+        let max_draft = self.ngram.as_ref().map_or(self.k, |ng| ng.cfg.draft_max.max(self.k)).min(TMAX - 1);
+        let room = self.ctx.saturating_sub(self.pos + 1).min(max_draft);
         let draft = match self.ngram.as_mut() {
             Some(ng) if room > 0 => ng.draft(t, room),
             _ => Vec::new(),

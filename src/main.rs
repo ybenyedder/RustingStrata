@@ -43,7 +43,7 @@ struct Engine {
     #[arg(long)]
     draft_model: Option<PathBuf>,
     /// Speculative context-lookup drafter type(s), comma-separated: none, ngram-simple, ngram-map-k, ngram-map-k4v,
-    /// ngram-mod, ngram-cache (mutually exclusive with --mtp).
+    /// ngram-mod, ngram-cache (combines with --mtp/--mtp-model in hybrid cascade).
     #[arg(long, default_value = "none")]
     spec_type: String,
     /// Maximum number of speculative draft tokens verified per step (1..=16).
@@ -304,14 +304,11 @@ impl Engine {
         }
         let mut ngram_cfg = self.ngram_config()?;
         ngram_cfg.n_vocab = m.cfg.n_vocab;
-        if ngram_cfg.is_enabled() && (self.mtp.unwrap_or(0) > 0 || self.mtp_model.is_some()) {
-            anyhow::bail!("--spec-type {} and --mtp/--mtp-model are mutually exclusive (combo causes severe regression; disable --mtp/--mtp-model or set --spec-type none)", self.spec_type);
-        }
         self.chunk.get_or_insert(get("chunk").unwrap_or(4096));
-        if ngram_cfg.is_enabled() {
-            self.mtp = Some(0);
-        } else if self.mtp_model.is_some() && self.mtp.is_none() {
+        if self.mtp_model.is_some() && self.mtp.is_none() {
             self.mtp = Some(1);
+        } else if ngram_cfg.is_enabled() && self.mtp.is_none() {
+            self.mtp = Some(0);
         } else {
             self.mtp.get_or_insert(get("mtp").unwrap_or(0));
         }
@@ -333,7 +330,7 @@ impl Engine {
         // shared memory (Vulkan; a no-op elsewhere). No pipeline or model buffer exists yet.
         let types = rusting_strata::gpu_model::gpu_weight_types(&m.w.g);
         for b in &bk { b.preflight(&types, false)?; }
-        let spec_k = if ngram_cfg.is_enabled() && self.parallel <= 1 { ngram_cfg.draft_max } else { self.mtp() };
+        let spec_k = if mtp > 0 { mtp } else if ngram_cfg.is_enabled() && self.parallel <= 1 { ngram_cfg.draft_max } else { 0 };
         let mut g = if self.parallel > 1 {
             GpuModel::load_split(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, 0, self.parallel).context(LOAD_HINT)?
         } else {
@@ -1280,6 +1277,11 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
         let next = match ahead.take() { Some(t) => t, None => smp.pick(&logits)? as u32 };
         if eos.contains(&next) { stopped = true; break; }
         let toks = match r {
+            Runner::Gpu(g) if mtp && g.ngram.is_some() => {
+                let (toks, nx, rw) = g.hybrid_spec_step(next, row, smp)?;
+                (ahead, row) = (Some(nx), rw);
+                toks
+            }
             Runner::Gpu(g) if mtp => {
                 let (toks, nx, rw) = g.spec_step(next, row, smp)?;
                 (ahead, row) = (Some(nx), rw);
@@ -1593,21 +1595,32 @@ impl Serving {
     }
 }
 
-/// Resolve `--mtp-model` (`.gguf` file, directory containing `model.gguf`, or HF `.safetensors`/`.bin` with a
-/// converted sibling `model.gguf`) and open it as a companion GGUF.
+/// Resolve `--mtp-model` (`.gguf` file, HF `.safetensors` file, or directory containing either `model.gguf` or
+/// `model.safetensors` + `config.json`) and open it as a companion GGUF. If `.gguf` is missing (or
+/// `STRATA_EAGLE3_RECONVERT` is set) and `.safetensors` + `config.json` are present, converts natively in Rust.
 fn open_mtp_gguf(path: Option<&Path>) -> anyhow::Result<Option<Gguf>> {
     let Some(p) = path else { return Ok(None) };
-    let gguf = if p.is_dir() {
-        p.join("model.gguf")
-    } else if matches!(p.extension().and_then(|e| e.to_str()), Some("safetensors" | "bin")) {
-        let sib = p.with_file_name("model.gguf");
-        if sib.exists() { sib } else { p.to_path_buf() }
+    let reconvert = std::env::var_os("STRATA_EAGLE3_RECONVERT").is_some();
+    let (gguf, st_cfg) = if p.is_dir() {
+        (p.join("model.gguf"), Some((p.join("model.safetensors"), p.join("config.json"))))
+    } else if p.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+        (p.with_extension("gguf"), Some((p.to_path_buf(), p.with_file_name("config.json"))))
+    } else if p.extension().and_then(|e| e.to_str()) == Some("bin") {
+        (p.with_file_name("model.gguf"), None)
     } else {
-        p.to_path_buf()
+        (p.to_path_buf(), None)
     };
+    if let Some((st, cfg)) = st_cfg
+        && (!gguf.exists() || reconvert)
+        && st.exists()
+        && cfg.exists()
+    {
+        eprintln!("note: native Rust EAGLE3 conversion {} -> {}", st.display(), gguf.display());
+        rusting_strata::gguf::convert_safetensors_eagle3_to_gguf(&st, &cfg, &gguf, 48)?;
+    }
     anyhow::ensure!(
         gguf.exists(),
-        "{}: not found (for HuggingFace EAGLE3 checkpoints, convert first via tools/convert_eagle3_to_gguf.py)",
+        "{}: not found (for PyTorch .bin EAGLE3 checkpoints, convert first via tools/convert_eagle3_to_gguf.py)",
         gguf.display()
     );
     Ok(Some(Gguf::open(&gguf)?))
