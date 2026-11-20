@@ -68,7 +68,7 @@ mod dev {
         }
         pub fn upload_on(&mut self, d: usize, data: &[u8], ty: GgmlType, rows: usize, cols: usize) -> Option<u32> {
             let p = &mut self.parts[d];
-            let t = p.be.upload(&Tensor { ty, cols, rows, data }).ok()?;
+            let t = p.be.upload(&Tensor { ty, cols, rows, data, scale: 1.0 }).ok()?;
             p.bytes += data.len();
             p.ts.push(t);
             Some((d as u32) << SHIFT | (p.ts.len() as u32 - 1))

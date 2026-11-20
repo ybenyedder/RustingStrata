@@ -356,7 +356,7 @@ fn build_shortlist(m: &Model, gpu: &dyn Backend, output: Option<&GpuTensor>) -> 
     let c = &m.cfg;
     if c.n_vocab <= 65536 || !gpu.supports_gemv_rows() { return Ok(None); }
     let Some(out) = output else { return Ok(None); };
-    if matches!(out.ty, GgmlType::F32 | GgmlType::BF16) { return Ok(None); }
+    if out.ty.is_float() { return Ok(None); }
     let Ok(crate::gguf::Value::Arr(arr)) = m.w.g.get("tokenizer.ggml.tokens") else { return Ok(None); };
     if arr.len() != c.n_vocab { return Ok(None); }
 
@@ -2201,7 +2201,7 @@ impl<'a> GpuModel<'a> {
                 g.rms_norm_q(df.x.addr(), ne, dl.post_norm.ptr, df.h.addr(), ne, ne, b_len, eps, hq, post_res)?;
                 let m_in = conv_prepare(dl.mlp_conv.as_ref(), df.h.addr(), false, true)?;
                 g.batch(&mut || g.gemvq2(&dl.gate, &dl.up, m_in, ne, hq, df.ge.addr(), df.ue.addr(), b_len))?;
-                let dq = if matches!(dl.down.ty, GgmlType::F32 | GgmlType::BF16) {
+                let dq = if dl.down.ty.is_float() {
                     g.swiglu(df.ge.addr(), df.ue.addr(), b_len * dc.n_ff)?;
                     0
                 } else {
@@ -3028,7 +3028,7 @@ impl<'a> GpuModel<'a> {
         let mv2 = |a: &GpuTensor, b: &GpuTensor, ya: &str, yb: &str| g.gemvq2(a, b, p("h"), ne, p("hq"), p(ya), p(yb), nt);
         // The SwiGLU for a down GEMV of type `ty` (float weights read g itself). Returns the xq for the GEMV.
         let sw = |ty: GgmlType, ga: &str, ua: &str, n: usize, rows: usize, q: &str| -> anyhow::Result<u64> {
-            if matches!(ty, GgmlType::F32 | GgmlType::BF16) { g.swiglu(p(ga), p(ua), rows * n)?; return Ok(0); }
+            if ty.is_float() { g.swiglu(p(ga), p(ua), rows * n)?; return Ok(0); }
             g.swiglu_q(p(ga), p(ua), n, rows, p(q))
         };
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
@@ -3296,7 +3296,7 @@ impl<'a> GpuModel<'a> {
                     // The previous token's routing of this layer, for the next token's prefetch (R3a).
                     let pid = self.pids.as_ref().map_or(0, |b| b.addr() + (4 * k * il) as u64);
                     // Resuming: what the skipped part left (the swiglu_q of Vulkan, the only backend that resumes).
-                    if resume { dq = if matches!(md.ty, GgmlType::F32 | GgmlType::BF16) { 0 } else { p("ffq") }; }
+                    if resume { dq = if md.ty.is_float() { 0 } else { p("ffq") }; }
                     // Prefetch the next layer's predicted experts while this layer runs (knob off by default).
                     if !resume { self.prefetch_next(il, &**g, cache, k)?; }
                     // The shared expert's GEMVs and swiglu share batches with the routed ones.
@@ -3350,7 +3350,7 @@ impl<'a> GpuModel<'a> {
                     g.moe_down_combine(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, k, p("ge"), p("ye"), dq,
                                         fx, p("wh"), sh, sg, mb, w.layout.y, step, nt)?;
                     if !self.m.loras.is_empty() {
-                        let use_ge = matches!(md.ty, GgmlType::F32 | GgmlType::BF16);
+                        let use_ge = md.ty.is_float();
                         self.apply_lora_gpu_down(il, nt, k, c.n_ff_exp, c.n_embd, l.hc.is_some(), use_ge)?;
                     }
                     if l.hc.is_some() { g.hc_write(x, p("mo"), p("inj"), ne, c.hc_n, nt, true)?; }

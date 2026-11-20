@@ -8,6 +8,8 @@ layout(constant_id = 2) const uint SBB = 1024;
 // with load_tables (all its invocations) first; the IQ4_NL LUT lives directly in register constants.
 const uint IQ4_LUT_W[4] = uint[4](0xbfad9881u, 0xf6eaddcfu, 0x26190d01u, 0x71594535u);
 int iq4_lut(uint nib) { return int(IQ4_LUT_W[nib >> 2u] << (24u - 8u * (nib & 3u))) >> 24; }
+const uint FP4_LUT_W[4] = uint[4](0x03020100u, 0x0c080604u, 0xfdfeff00u, 0xf4f8fafcu);
+int fp4_lut(uint nib) { return int(FP4_LUT_W[nib >> 2u] << (24u - 8u * (nib & 3u))) >> 24; }
 #ifdef SHARED_TABLES
 // Sized by T (1 entry for the other types), so only the table in use takes shared memory.
 shared uint s_g3[T == 21 ? 512 : (T == 18 ? 256 : 1)];
@@ -28,6 +30,19 @@ uint ld16(U8 w, uint o) { return uint(U16(uint64_t(w)).v[o >> 1]); }  // 2-align
 uint ld32(U8 w, uint o) { return ld16(w, o) | ld16(w, o + 2) << 16; }
 float h2f(uint h) { return float(uint16BitsToFloat16(uint16_t(h))); }
 float ldh(U8 w, uint o) { return h2f(ld16(w, o)); }
+float ue4m3_to_f32(uint x) {
+    if (x == 0u || x == 0x7Fu) return 0.0;
+    uint exp = (x >> 3u) & 0xFu, man = x & 7u;
+    float raw = (exp == 0u) ? float(man) * (1.0 / 512.0) : uintBitsToFloat(((exp + 120u) << 23u) | (man << 20u));
+    return raw * 0.5;
+}
+float f8_e4m3_to_f32(uint x) {
+    uint ax = x & 0x7Fu;
+    if (ax == 0u || ax == 0x7Fu) return 0.0;
+    uint exp = ax >> 3u, man = ax & 7u;
+    float mag = (exp == 0u) ? float(man) * (1.0 / 512.0) : uintBitsToFloat(((exp + 120u) << 23u) | (man << 20u));
+    return (x & 0x80u) != 0u ? -mag : mag;
+}
 // Bytes of a row of `cols` values (a multiple of the type's block).
 uint rowb(uint cols) { return cols * SBB / 256; }
 int sb(uint x) { return int(x << 24) >> 24; }  // the low byte, signed
@@ -57,9 +72,9 @@ int sgn(uint g, uint sg, uint j) { int v = int((g >> (8 * (j & 3))) & 255); retu
 
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer U32x2 { uvec2 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer U32x4 { uvec4 v[]; };
-// Q4_K, Q5_K and IQ4_XS blocks (144, 176, 136 bytes) and every field ld8 reads in them are 8-aligned; Q2_K's (84) 4-aligned.
+// Q4_K, Q5_K and IQ4_XS blocks (144, 176, 136 bytes) and every field ld8 reads in them are 8-aligned; Q2_K's (84) and NVFP4's (36) 4-aligned.
 const bool A8 = T == 12 || T == 13 || T == 23;
-const bool A4 = T == 10 || T == 3 || T == 7;  // and Q4_1, Q5_1 (20, 24)
+const bool A4 = T == 10 || T == 3 || T == 7 || T == 40 || T == 43;  // and Q4_1, Q5_1, NVFP4, F8_E4M3 (20, 24, 36, 4n)
 // 8 bytes at 2-aligned w + o: one load for the A8 types, two word loads for A4, else the three words around them
 // shifted (ld8a2 in kernels.cu) without a branch: in Q8_0 the lanes of a subgroup differ in alignment.
 uvec2 ld8(U8 w, uint o) {
@@ -236,6 +251,11 @@ void qi8(U8 w, uint b, uint sub, out int q[8], out float d, out float m) {
         uint e = sub * 8, j = e >> 7, l = (e >> 5) & 3, m = e & 31;
         d = ldh(w, b + 64);
         [[unroll]] for (uint i = 0; i < 8; i++) q[i] = int((u8_(w, b + 32 * j + m + i) >> (2 * l)) & 3) - 1;
+    } else if (T == 40) {  // NVFP4: 4 blocks of 36 bytes per 256-elem super-block; 4 x UE4M3 scales @0, 4x8 nibble bytes @4
+        uint p = b + 36u * (sub >> 3u), s = (sub >> 1u) & 3u, sh = (sub & 1u) * 4u;
+        d = ue4m3_to_f32(u8_(w, p + s));
+        uvec2 v = ld8(w, p + 4u + 8u * s);
+        [[unroll]] for (uint i = 0; i < 8; i++) q[i] = fp4_lut(((i < 4 ? v.x : v.y) >> (8u * (i & 3u) + sh)) & 15u);
     } else {  // IQ4_XS (23), IQ4_NL (20, 8 blocks of 18)
         uint r = l * 8, o;
         if (T == 23) {
@@ -385,6 +405,9 @@ void deq8(U8 w, uint b, uint sub, out float o[8]) {
     } else if (T == 30) {  // BF16
         uvec4 q = U32x4(uint64_t(w) + b + 16 * sub).v[0];  // rows of BF16 start 16-aligned (cols % 8 == 0)
         [[unroll]] for (uint i = 0; i < 4; i++) { o[2 * i] = uintBitsToFloat(q[i] << 16); o[2 * i + 1] = uintBitsToFloat(q[i] & 0xFFFF0000u); }
+    } else if (T == 43) {  // F8_E4M3
+        uvec2 v = ld8(w, b + sub * 8u);
+        [[unroll]] for (uint i = 0; i < 8; i++) o[i] = f8_e4m3_to_f32(((i < 4 ? v.x : v.y) >> (8u * (i & 3u))) & 0xFFu);
     } else {
         int q[8]; float d, m;
         qi8(w, b, sub, q, d, m);
